@@ -13,7 +13,7 @@ const bigquery = new BigQuery({
 });
 
 const datasetId = 'Client_audits';           // dataset name
-const tableId = 'Client Audits - Jobs';      // table name
+const tableId = 'client_audits_jobs';      // table name
 
 // === POST /jobs - submit a new job ===
 app.post('/jobs', async (req, res) => {
