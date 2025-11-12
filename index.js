@@ -13,7 +13,7 @@ const bigquery = new BigQuery({
 });
 
 const datasetId = 'ghs-construction-1734441714520';           // dataset name
-const tableId = 'Client_audits.Client Audits - Jobs';      // table name
+const tableId = 'client_audits_jobs';      // table name
 
 // === POST /jobs - submit a new job ===
 app.post('/jobs', async (req, res) => {
