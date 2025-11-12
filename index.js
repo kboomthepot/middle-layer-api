@@ -32,18 +32,21 @@ app.post('/jobs', async (req, res) => {
     budget,
     location,
     status: 'queued',
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString(),
   };
 
   try {
     await bigquery.dataset(datasetId).table(tableId).insert([row]);
+    console.log(`✅ Job inserted successfully: ${jobId}`);
     simulateReport(jobId);
     res.json({ jobId, status: 'queued' });
   } catch (err) {
-    console.error('BigQuery insert error:', err);
-    res.status(500).json({ error: 'Failed to insert job', details: err.message });
+    console.error('❌ BigQuery Insert Error:', err);
+    const message = err.errors ? JSON.stringify(err.errors) : err.message;
+    res.status(500).json({ error: 'Failed to insert job', details: message });
   }
 });
+
 
 
 // === GET /status?jobId= - check job status ===
