@@ -20,10 +20,6 @@ app.post('/jobs', async (req, res) => {
   const jobId = uuidv4();
   const { user, business, revenue, budget, services, location } = req.body;
 
-  if (!user || !business) {
-    return res.status(400).json({ error: 'User and business info are required' });
-  }
-
   const row = {
     jobId,
     userName: user.name,
@@ -31,27 +27,24 @@ app.post('/jobs', async (req, res) => {
     phone: user.phone,
     businessName: business.name,
     website: business.website,
-    services: JSON.stringify(services || []),
-    revenue: revenue || 0,
-    budget: budget || 0,
-    location: location || '',
+    services: JSON.stringify(services),
+    revenue,
+    budget,
+    location,
     status: 'queued',
     createdAt: new Date().toISOString()
   };
 
   try {
     await bigquery.dataset(datasetId).table(tableId).insert([row]);
-    console.log(`Inserted job ${jobId}`);
-
-    // Simulate report processing
     simulateReport(jobId);
-
     res.json({ jobId, status: 'queued' });
   } catch (err) {
-    console.error('Failed to insert job:', err);
-    res.status(500).json({ error: 'Failed to insert job' });
+    console.error('BigQuery insert error:', err);
+    res.status(500).json({ error: 'Failed to insert job', details: err.message });
   }
 });
+
 
 // === GET /status?jobId= - check job status ===
 app.get('/status', async (req, res) => {
