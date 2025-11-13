@@ -20,14 +20,20 @@ app.post('/jobs', async (req, res) => {
   const jobId = uuidv4();
   const { user, business, revenue, budget, services, location } = req.body;
 
-  const row = {
+    const row = {
     jobId,
-    userName: user.name,
+    // ⬇️ NEW: store first & last name separately
+    firstName: user.firstName || null,
+    lastName: user.lastName || null,
+
+    // ⬇️ REMOVE this line if you dropped the userName column from BigQuery
+    // userName: user.name,
+
     email: user.email,
     phone: user.phone,
     businessName: business.name,
     website: business.website,
-    services: JSON.stringify(services),
+    services: JSON.stringify(services || []),
     revenue,
     budget,
     location,
@@ -46,7 +52,6 @@ app.post('/jobs', async (req, res) => {
     res.status(500).json({ error: 'Failed to insert job', details: message });
   }
 });
-
 
 
 // === GET /status?jobId= - check job status ===
