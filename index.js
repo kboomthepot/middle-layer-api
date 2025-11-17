@@ -51,3 +51,9 @@ app.post('/jobs', async (req, res) => {
     res.status(500).json({ error: 'Failed to insert job', details: message });
   }
 });
+
+const port = process.env.PORT || 8080;
+app.listen(port, () => {
+  console.log(`Middle-layer API running on port ${port}`);
+});
+
