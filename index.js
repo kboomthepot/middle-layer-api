@@ -7,15 +7,19 @@ const app = express();
 app.use(bodyParser.json());
 
 // === BigQuery setup ===
+const PROJECT_ID = 'ghs-construction-1734441714520';
+
 const bigquery = new BigQuery({
-  projectId: 'ghs-construction-1734441714520', // your GCP project ID
+  projectId: PROJECT_ID,
   // keyFilename: './service-account.json', // only if testing locally
 });
 
-const datasetId = 'Client_audits';           // dataset name
-const tableId = 'client_audits_jobs';      // table name
+// === Dataset & table IDs ===
+const DATASET_ID = 'Client_audits';
+const JOBS_TABLE_ID = 'client_audits_jobs';
+const DEMOGRAPHICS_SOURCE_TABLE_ID = '1_demographics';
+const JOBS_DEMOGRAPHICS_TABLE_ID = 'jobs_demographics';
 
-// === POST /jobs - submit a new job ===
 // === POST /jobs - submit a new job ===
 app.post('/jobs', async (req, res) => {
   const jobId = uuidv4();
@@ -43,19 +47,24 @@ app.post('/jobs', async (req, res) => {
     // overall job status
     status: 'queued',
 
-    // ✳️ NEW: section / report-part statuses
-    demographicsStatus: 'queued', // will later move to 'pending' / 'completed'
-    paidAdsStatus: 'queued',      // same here
+    // section / report-part statuses
+    demographicsStatus: 'queued', // will be set to 'completed' by processDemographics
+    paidAdsStatus: 'queued',
 
     createdAt: new Date().toISOString(),
   };
 
   try {
-    await bigquery.dataset(datasetId).table(tableId).insert([row]);
+    await bigquery.dataset(DATASET_ID).table(JOBS_TABLE_ID).insert([row]);
     console.log(`✅ Job inserted successfully: ${jobId}`);
 
-    // you can keep this for now, or later replace with your real section runners
+    // Simulated global status updates (keep for now)
     simulateReport(jobId);
+
+    // 🔹 Start demographics processing in background
+    processDemographics(jobId).catch((err) => {
+      console.error(`❌ Demographics processing failed for job ${jobId}:`, err);
+    });
 
     res.json({
       jobId,
@@ -70,22 +79,29 @@ app.post('/jobs', async (req, res) => {
   }
 });
 
-
-
 // === GET /status?jobId= - check job status ===
 app.get('/status', async (req, res) => {
   const { jobId } = req.query;
   if (!jobId) return res.status(400).json({ error: 'jobId is required' });
 
   const query = {
-    query: `SELECT status FROM \`${bigquery.projectId}.${datasetId}.${tableId}\` WHERE jobId=@jobId`,
-    params: { jobId }
+    query: `SELECT status, demographicsStatus, paidAdsStatus
+            FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+            WHERE jobId=@jobId`,
+    params: { jobId },
   };
 
   try {
     const [rows] = await bigquery.query(query);
     if (!rows.length) return res.status(404).json({ error: 'Job not found' });
-    res.json({ jobId, status: rows[0].status });
+
+    const row = rows[0];
+    res.json({
+      jobId,
+      status: row.status,
+      demographicsStatus: row.demographicsStatus,
+      paidAdsStatus: row.paidAdsStatus,
+    });
   } catch (err) {
     console.error('Failed to fetch job status:', err);
     res.status(500).json({ error: 'Failed to fetch status' });
@@ -94,7 +110,11 @@ app.get('/status', async (req, res) => {
 
 // === GET /jobs - list all jobs (dashboard) ===
 app.get('/jobs', async (req, res) => {
-  const query = `SELECT * FROM \`${bigquery.projectId}.${datasetId}.${tableId}\` ORDER BY createdAt DESC`;
+  const query = `
+    SELECT *
+    FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+    ORDER BY createdAt DESC
+  `;
 
   try {
     const [rows] = await bigquery.query({ query });
@@ -111,8 +131,9 @@ app.delete('/jobs/:jobId', async (req, res) => {
   if (!jobId) return res.status(400).json({ error: 'jobId is required' });
 
   const query = {
-    query: `DELETE FROM \`${bigquery.projectId}.${datasetId}.${tableId}\` WHERE jobId=@jobId`,
-    params: { jobId }
+    query: `DELETE FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+            WHERE jobId=@jobId`,
+    params: { jobId },
   };
 
   try {
@@ -125,16 +146,100 @@ app.delete('/jobs/:jobId', async (req, res) => {
   }
 });
 
-// === Simulate report processing ===
+// === Demographics processing ===
+async function processDemographics(jobId) {
+  console.log(`🚀 Starting demographics processing for job ${jobId}`);
+
+  // 1) Get job location from client_audits_jobs
+  const [jobRows] = await bigquery.query({
+    query: `SELECT location
+            FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+            WHERE jobId=@jobId`,
+    params: { jobId },
+  });
+
+  if (!jobRows.length) {
+    console.warn(`⚠️ No job found for jobId ${jobId} when processing demographics`);
+    return;
+  }
+
+  const location = jobRows[0].location;
+  console.log(`ℹ️ Job ${jobId} location: ${location}`);
+
+  // 2) Fetch demographics for that location from 1_demographics
+  const [demoRows] = await bigquery.query({
+    query: `SELECT
+              location,
+              population_no,
+              median_age,
+              households_no,
+              median_income_households,
+              median_income_families,
+              male_percentage,
+              female_percentage
+            FROM \`${PROJECT_ID}.${DATASET_ID}.${DEMOGRAPHICS_SOURCE_TABLE_ID}\`
+            WHERE location=@location`,
+    params: { location },
+  });
+
+  if (!demoRows.length) {
+    console.warn(`⚠️ No demographics found for location "${location}"`);
+    // Mark demographicsStatus as no_data so frontend can show it
+    await bigquery.query({
+      query: `UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+              SET demographicsStatus=@status
+              WHERE jobId=@jobId`,
+      params: { jobId, status: 'no_data' },
+    });
+    return;
+  }
+
+  const demo = demoRows[0];
+
+  // 3) Insert into jobs_demographics table
+  const demographicsRow = {
+    jobId,
+    status: 'completed',
+    location: demo.location,
+    population_no: demo.population_no,
+    median_age: demo.median_age,
+    households_no: demo.households_no,
+    median_income_households: demo.median_income_households,
+    median_income_families: demo.median_income_families,
+    male_percentage: demo.male_percentage,
+    female_percentage: demo.female_percentage,
+  };
+
+  await bigquery
+    .dataset(DATASET_ID)
+    .table(JOBS_DEMOGRAPHICS_TABLE_ID)
+    .insert([demographicsRow]);
+
+  console.log(`✅ Demographics row inserted for job ${jobId}`);
+
+  // 4) Update demographicsStatus in client_audits_jobs
+  await bigquery.query({
+    query: `UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+            SET demographicsStatus=@status
+            WHERE jobId=@jobId`,
+    params: { jobId, status: 'completed' },
+  });
+
+  console.log(`✅ demographicsStatus set to 'completed' for job ${jobId}`);
+}
+
+// === Simulate report processing (overall status only, for now) ===
 async function simulateReport(jobId) {
   const statuses = ['in_progress', 'completed'];
   const delay = 3000; // 3 seconds between updates
 
   for (const status of statuses) {
-    await new Promise(resolve => setTimeout(resolve, delay));
+    await new Promise((resolve) => setTimeout(resolve, delay));
     const query = {
-      query: `UPDATE \`${bigquery.projectId}.${datasetId}.${tableId}\` SET status=@status WHERE jobId=@jobId`,
-      params: { jobId, status }
+      query: `UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+              SET status=@status
+              WHERE jobId=@jobId`,
+      params: { jobId, status },
     };
 
     try {
