@@ -1,6 +1,15 @@
 app.post('/jobs', async (req, res) => {
+  // provide safe defaults so we don't crash if some fields are missing
+  const {
+    user = {},
+    business = {},
+    revenue = null,
+    budget = null,
+    services = [],
+    location = null,
+  } = req.body;
+
   const jobId = uuidv4();
-  const { user, business, revenue, budget, services, location } = req.body;
 
   const row = {
     jobId,
@@ -8,12 +17,12 @@ app.post('/jobs', async (req, res) => {
     // user fields
     firstName: user.firstName || null,
     lastName: user.lastName || null,
-    email: user.email,
-    phone: user.phone,
+    email: user.email || null,
+    phone: user.phone || null,
 
     // business fields
-    businessName: business.name,
-    website: business.website,
+    businessName: business.name || null,
+    website: business.website || null,
 
     // job context
     services: JSON.stringify(services || []),
@@ -35,7 +44,7 @@ app.post('/jobs', async (req, res) => {
     await bigquery.dataset(DATASET_ID).table(JOBS_TABLE_ID).insert([row]);
     console.log(`✅ Job inserted successfully: ${jobId}`);
 
-    // ❌ remove direct processing calls here
+    // no direct processing here
     // processDemographics(jobId, location);
     // simulateReport(jobId);
 
