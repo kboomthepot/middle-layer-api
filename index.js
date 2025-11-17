@@ -48,7 +48,7 @@ app.post('/jobs', async (req, res) => {
     status: 'queued',
 
     // section / report-part statuses
-    demographicsStatus: 'queued', // will be set to 'completed' by processDemographics
+    demographicsStatus: 'queued',
     paidAdsStatus: 'queued',
 
     createdAt: new Date().toISOString(),
@@ -57,9 +57,6 @@ app.post('/jobs', async (req, res) => {
   try {
     await bigquery.dataset(DATASET_ID).table(JOBS_TABLE_ID).insert([row]);
     console.log(`✅ Job inserted successfully: ${jobId}`);
-
-    // Simulated global status updates (keep for now)
-    simulateReport(jobId);
 
     // 🔹 Start demographics processing in background
     processDemographics(jobId).catch((err) => {
@@ -184,13 +181,17 @@ async function processDemographics(jobId) {
 
   if (!demoRows.length) {
     console.warn(`⚠️ No demographics found for location "${location}"`);
-    // Mark demographicsStatus as no_data so frontend can show it
+
+    // Mark demographicsStatus as no_data
     await bigquery.query({
       query: `UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
               SET demographicsStatus=@status
               WHERE jobId=@jobId`,
       params: { jobId, status: 'no_data' },
     });
+
+    // Re-evaluate overall job status
+    await updateOverallStatus(jobId);
     return;
   }
 
@@ -226,29 +227,56 @@ async function processDemographics(jobId) {
   });
 
   console.log(`✅ demographicsStatus set to 'completed' for job ${jobId}`);
+
+  // 5) Re-evaluate overall job status after this segment is done
+  await updateOverallStatus(jobId);
 }
 
-// === Simulate report processing (overall status only, for now) ===
-async function simulateReport(jobId) {
-  const statuses = ['in_progress', 'completed'];
-  const delay = 3000; // 3 seconds between updates
+// === Helper: update overall job status based on segment statuses ===
+async function updateOverallStatus(jobId) {
+  console.log(`🔄 Re-evaluating overall status for job ${jobId}`);
 
-  for (const status of statuses) {
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    const query = {
-      query: `UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-              SET status=@status
-              WHERE jobId=@jobId`,
-      params: { jobId, status },
-    };
+  const [rows] = await bigquery.query({
+    query: `SELECT demographicsStatus, paidAdsStatus
+            FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+            WHERE jobId=@jobId`,
+    params: { jobId },
+  });
 
-    try {
-      await bigquery.query(query);
-      console.log(`Job ${jobId} status updated to ${status}`);
-    } catch (err) {
-      console.error(`Failed to update job status for ${jobId}:`, err);
-    }
+  if (!rows.length) {
+    console.warn(`⚠️ Job not found when updating overall status for jobId ${jobId}`);
+    return;
   }
+
+  const { demographicsStatus, paidAdsStatus } = rows[0];
+
+  const sectionStatuses = [demographicsStatus, paidAdsStatus].filter(Boolean);
+  const FINISHED_STATUSES = ['completed', 'no_data'];
+
+  let newStatus = 'queued';
+
+  // If everything is finished (completed or no_data) → completed
+  if (
+    sectionStatuses.length > 0 &&
+    sectionStatuses.every((s) => FINISHED_STATUSES.includes(s))
+  ) {
+    newStatus = 'completed';
+  } else if (sectionStatuses.some((s) => s === 'in_progress')) {
+    // Any segment in progress → in_progress
+    newStatus = 'in_progress';
+  } else {
+    // Otherwise keep it queued (e.g. queued/mixture but nothing started)
+    newStatus = 'queued';
+  }
+
+  await bigquery.query({
+    query: `UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+            SET status=@status
+            WHERE jobId=@jobId`,
+    params: { jobId, status: newStatus },
+  });
+
+  console.log(`✅ Overall status for job ${jobId} set to '${newStatus}'`);
 }
 
 // === Start server ===
