@@ -195,8 +195,8 @@ async function processDemographics(jobId, location) {
       median_income_families: demo.median_income_families,
       male_percentage: demo.male_percentage,
       female_percentage: demo.female_percentage,
-      createdAt: new Date().toISOString(),
     };
+
 
     console.log('processDemographics: inserting into jobs_demographics:', demographicsRow);
 
