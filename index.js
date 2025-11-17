@@ -16,42 +16,60 @@ const datasetId = 'Client_audits';           // dataset name
 const tableId = 'client_audits_jobs';      // table name
 
 // === POST /jobs - submit a new job ===
+// === POST /jobs - submit a new job ===
 app.post('/jobs', async (req, res) => {
   const jobId = uuidv4();
   const { user, business, revenue, budget, services, location } = req.body;
 
-    const row = {
+  const row = {
     jobId,
-    // ⬇️ NEW: store first & last name separately
+
+    // user fields
     firstName: user.firstName || null,
     lastName: user.lastName || null,
-
-    // ⬇️ REMOVE this line if you dropped the userName column from BigQuery
-    // userName: user.name,
-
     email: user.email,
     phone: user.phone,
+
+    // business fields
     businessName: business.name,
     website: business.website,
+
+    // job context
     services: JSON.stringify(services || []),
     revenue,
     budget,
     location,
+
+    // overall job status
     status: 'queued',
+
+    // ✳️ NEW: section / report-part statuses
+    demographicsStatus: 'queued', // will later move to 'pending' / 'completed'
+    paidAdsStatus: 'queued',      // same here
+
     createdAt: new Date().toISOString(),
   };
 
   try {
     await bigquery.dataset(datasetId).table(tableId).insert([row]);
     console.log(`✅ Job inserted successfully: ${jobId}`);
+
+    // you can keep this for now, or later replace with your real section runners
     simulateReport(jobId);
-    res.json({ jobId, status: 'queued' });
+
+    res.json({
+      jobId,
+      status: 'queued',
+      demographicsStatus: 'queued',
+      paidAdsStatus: 'queued',
+    });
   } catch (err) {
     console.error('❌ BigQuery Insert Error:', err);
     const message = err.errors ? JSON.stringify(err.errors) : err.message;
     res.status(500).json({ error: 'Failed to insert job', details: message });
   }
 });
+
 
 
 // === GET /status?jobId= - check job status ===
