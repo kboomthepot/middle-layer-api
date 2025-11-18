@@ -20,7 +20,7 @@ const JOBS_TABLE_ID = 'client_audits_jobs';
 
 // Pub/Sub client
 const pubsub = new PubSub({ projectId: PROJECT_ID });
-const JOB_EVENTS_TOPIC = 'client-audits-job-events';
+const JOB_EVENTS_TOPIC = 'client-audits-job';
 
 // ---------- HEALTH CHECK ----------
 app.get('/', (req, res) => {
