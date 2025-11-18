@@ -11,18 +11,14 @@ app.use(bodyParser.json());
 // === GCP setup ===
 const PROJECT_ID = 'ghs-construction-1734441714520';
 
-// BigQuery
+// BigQuery client
 const bigquery = new BigQuery({ projectId: PROJECT_ID });
 
 // Dataset + main jobs table
 const DATASET_ID = 'Client_audits';
 const JOBS_TABLE_ID = 'client_audits_jobs';
 
-// (Old demographics constants left here if you still want run-demographics later)
-const DEMOGRAPHICS_SOURCE_TABLE_ID = '1_demographics';
-const JOBS_DEMOGRAPHICS_TABLE_ID = 'jobs_demographics';
-
-// Pub/Sub
+// Pub/Sub client
 const pubsub = new PubSub({ projectId: PROJECT_ID });
 const JOB_EVENTS_TOPIC = 'client-audits-job-events';
 
@@ -56,7 +52,6 @@ app.post('/jobs', async (req, res) => {
 
   const createdAt = new Date().toISOString();
 
-  // Build row fields
   const row = {
     jobId,
 
@@ -87,9 +82,9 @@ app.post('/jobs', async (req, res) => {
   };
 
   try {
-    // Use DML INSERT instead of streaming insert
+    // DML INSERT to avoid streaming buffer
     const insertQuery = `
-      INSERT \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      INSERT \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
         (jobId, firstName, lastName, email, phone,
          businessName, website, services,
          revenue, budget, location,
@@ -124,7 +119,7 @@ app.post('/jobs', async (req, res) => {
 
     console.log(`✅ Job inserted successfully (DML): ${jobId}`);
 
-    // Publish event so worker can pick it up
+    // publish event to worker
     await publishJobEvent({ jobId, location, createdAt });
 
     res.json({
@@ -148,7 +143,7 @@ app.get('/status', async (req, res) => {
   const query = {
     query: `
       SELECT status, demographicsStatus, paidAdsStatus
-      FROM \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
     `,
@@ -176,7 +171,7 @@ app.get('/status', async (req, res) => {
 app.get('/jobs', async (req, res) => {
   const query = `
     SELECT *
-    FROM \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+    FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
     ORDER BY createdAt DESC
   `;
 
@@ -196,7 +191,7 @@ app.delete('/jobs/:jobId', async (req, res) => {
 
   const query = {
     query: `
-      DELETE FROM \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      DELETE FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
     `,
     params: { jobId },
@@ -211,9 +206,6 @@ app.delete('/jobs/:jobId', async (req, res) => {
     res.status(500).json({ error: 'Failed to delete job' });
   }
 });
-
-// (Optional) You can keep or remove old /run-demographics & runDemographics() here
-// since the new worker now owns demographics.
 
 // === Start server ===
 const port = process.env.PORT || 8080;
