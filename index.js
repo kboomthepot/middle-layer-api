@@ -1,16 +1,26 @@
-// index.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const { BigQuery } = require('@google-cloud/bigquery');
+const { PubSub } = require('@google-cloud/pubsub');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(bodyParser.json());
 
-// === BigQuery setup ===
+// === GCP setup ===
+const PROJECT_ID = 'ghs-construction-1734441714520';
+
+// BigQuery setup
 const bigquery = new BigQuery({
-  projectId: 'ghs-construction-1734441714520',
+  projectId: PROJECT_ID,
 });
+
+// Pub/Sub setup
+const pubsub = new PubSub({
+  projectId: PROJECT_ID,
+});
+
+const PUBSUB_TOPIC_ID = 'client-audit-jobs';
 
 // Dataset + main jobs table
 const DATASET_ID = 'Client_audits';
@@ -32,6 +42,8 @@ app.post('/jobs', async (req, res) => {
     services = [],
     location = null,
   } = req.body;
+
+  const createdAt = new Date().toISOString();
 
   const row = {
     jobId,
@@ -59,15 +71,34 @@ app.post('/jobs', async (req, res) => {
     demographicsStatus: 'queued',
     paidAdsStatus: 'queued',
 
-    createdAt: new Date().toISOString(), // STRING or TIMESTAMP-compatible
+    createdAt, // STRING or TIMESTAMP-compatible
   };
 
   try {
+    // 1) Insert job into BigQuery
     await bigquery.dataset(DATASET_ID).table(JOBS_TABLE_ID).insert([row]);
     console.log(`✅ Job inserted successfully: ${jobId}`);
 
-    // No workers, no fake status changes here
+    // 2) Publish Pub/Sub message so worker can process it
+    try {
+      const messageId = await pubsub
+        .topic(PUBSUB_TOPIC_ID)
+        .publishMessage({
+          json: {
+            jobId,
+            location,
+            createdAt,
+            // You can add more fields if future worker needs them
+          },
+        });
 
+      console.log(`📨 Published job ${jobId} to Pub/Sub with messageId=${messageId}`);
+    } catch (pubsubErr) {
+      // Important: log, but don't fail the API call if Pub/Sub publish has an issue
+      console.error(`⚠️ Failed to publish job ${jobId} to Pub/Sub:`, pubsubErr);
+    }
+
+    // 3) Respond to caller
     res.json({
       jobId,
       status: 'queued',
