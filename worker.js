@@ -13,14 +13,8 @@ const JOBS_TABLE_ID = 'client_audits_jobs';
 const bigquery = new BigQuery({ projectId: PROJECT_ID });
 
 // Pub/Sub push endpoint
-// Pub/Sub (via Cloud Run / Eventarc) will POST messages here
 app.post('/', async (req, res) => {
   try {
-    // Messages can come in different formats depending on trigger type.
-    // We handle the standard Pub/Sub push format:
-    //
-    // { "message": { "data": "<base64-encoded JSON>" }, "subscription": "..." }
-
     const pubsubMessage = req.body?.message;
     if (!pubsubMessage || !pubsubMessage.data) {
       console.error('⚠️ No message data received', req.body);
@@ -39,24 +33,16 @@ app.post('/', async (req, res) => {
       return res.status(400).send('Bad Request: missing jobId');
     }
 
-    // 👉 Here is where we'll later:
-    // - read job row from Client_audits.client_audits_jobs
-    // - fetch demographics from 1_demographics
-    // - insert into jobs_demographics
-    // - update statuses in jobs table
-
     console.log(`✅ Worker received job ${jobId} (location=${location || 'N/A'})`);
 
-    // Always respond 204 to acknowledge the message
     return res.status(204).send();
   } catch (err) {
     console.error('❌ Error handling Pub/Sub message:', err);
-    // 500 means "retry". If you want fewer retries later, we can adjust config.
     return res.status(500).send('Internal Server Error');
   }
 });
 
-// Health endpoint (optional but nice)
+// Health endpoint
 app.get('/', (req, res) => {
   res.send('Worker service is running');
 });
