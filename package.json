@@ -3,14 +3,14 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
-	"start:worker": "node worker.js"
+    "start": "node index.js",
+    "start:worker": "node worker.js"
   },
-    "dependencies": {
+  "dependencies": {
     "express": "^4.19.0",
     "body-parser": "^1.20.2",
     "@google-cloud/bigquery": "^7.7.0",
-    "@google-cloud/pubsub": "^5.7.0",
+    "@google-cloud/pubsub": "^5.0.0",
     "uuid": "^9.0.1"
   },
   "engines": {
