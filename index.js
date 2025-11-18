@@ -16,16 +16,12 @@ const bigquery = new BigQuery({
 const DATASET_ID = 'Client_audits';
 const JOBS_TABLE_ID = 'client_audits_jobs';
 
-// Other tables
-const DEMOGRAPHICS_SOURCE_TABLE_ID = '1_demographics';
-const JOBS_DEMOGRAPHICS_TABLE_ID = 'jobs_demographics';
-
 // ---------- HEALTH CHECK ----------
 app.get('/', (req, res) => {
   res.send('Middle-layer API is running');
 });
 
-// === POST /jobs - submit a new job ===
+// === POST /jobs - submit a new job (CREATE ONLY) ===
 app.post('/jobs', async (req, res) => {
   const jobId = uuidv4();
   const {
@@ -59,7 +55,7 @@ app.post('/jobs', async (req, res) => {
     // overall job status
     status: 'queued',
 
-    // section statuses
+    // section statuses (initial state)
     demographicsStatus: 'queued',
     paidAdsStatus: 'queued',
 
@@ -70,7 +66,7 @@ app.post('/jobs', async (req, res) => {
     await bigquery.dataset(DATASET_ID).table(JOBS_TABLE_ID).insert([row]);
     console.log(`✅ Job inserted successfully: ${jobId}`);
 
-    // ⛔ Removed fake progression: no more simulateReport(jobId)
+    // No workers, no fake status changes here
 
     res.json({
       jobId,
@@ -85,7 +81,7 @@ app.post('/jobs', async (req, res) => {
   }
 });
 
-// === GET /status?jobId= - check job status ===
+// === GET /status?jobId= - check job status (from jobs table only) ===
 app.get('/status', async (req, res) => {
   const { jobId } = req.query;
   if (!jobId) return res.status(400).json({ error: 'jobId is required' });
@@ -156,151 +152,6 @@ app.delete('/jobs/:jobId', async (req, res) => {
     res.status(500).json({ error: 'Failed to delete job' });
   }
 });
-
-// === DEMOGRAPHICS WORKER ===
-
-// HTTP endpoint that scheduler or you can call to process queued demographics jobs
-app.get('/run-demographics', async (req, res) => {
-  try {
-    const result = await runDemographics();
-    res.json(result);
-  } catch (err) {
-    console.error('❌ /run-demographics error:', err);
-    res.status(500).json({ error: 'Failed to run demographics worker', details: err.message });
-  }
-});
-
-/**
- * Find all jobs with demographicsStatus = 'queued',
- * fetch demographics for each job.location from 1_demographics,
- * insert into jobs_demographics, and update statuses in client_audits_jobs.
- */
-async function runDemographics() {
-  console.log('▶️ Starting demographics worker...');
-
-  // 1) Get all jobs that need demographics processing
-  const jobsQuery = {
-    query: `
-      SELECT jobId, location, paidAdsStatus, status
-      FROM \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-      WHERE demographicsStatus = 'queued'
-    `,
-  };
-
-  const [jobRows] = await bigquery.query(jobsQuery);
-
-  if (!jobRows.length) {
-    console.log('No jobs with demographicsStatus = "queued".');
-    return { processedJobs: 0 };
-  }
-
-  console.log(`Found ${jobRows.length} job(s) with demographicsStatus = "queued".`);
-
-  let processedCount = 0;
-  let skippedNoLocation = 0;
-  let skippedNoDemographics = 0;
-  let errors = [];
-
-  for (const job of jobRows) {
-    const { jobId, location, paidAdsStatus } = job;
-
-    if (!location) {
-      console.warn(`Job ${jobId} has no location; skipping.`);
-      skippedNoLocation++;
-      continue;
-    }
-
-    try {
-      // 2) Fetch demographics row from 1_demographics by location
-      const [demoRows] = await bigquery.query({
-        query: `
-          SELECT
-            population_no,
-            median_age,
-            households_no,
-            median_income_households,
-            median_income_families,
-            male_percentage,
-            female_percentage
-          FROM \`${bigquery.projectId}.${DATASET_ID}.${DEMOGRAPHICS_SOURCE_TABLE_ID}\`
-          WHERE location = @location
-          LIMIT 1
-        `,
-        params: { location },
-      });
-
-      if (!demoRows.length) {
-        console.warn(`No demographics found for location "${location}" (jobId: ${jobId}). Skipping.`);
-        skippedNoDemographics++;
-        continue;
-      }
-
-      const d = demoRows[0];
-
-      // 3) Delete existing row for this jobId to keep idempotent
-      await bigquery.query({
-        query: `
-          DELETE FROM \`${bigquery.projectId}.${DATASET_ID}.${JOBS_DEMOGRAPHICS_TABLE_ID}\`
-          WHERE jobId = @jobId
-        `,
-        params: { jobId },
-      });
-
-      const demographicsRow = {
-        jobId,
-        status: 'completed', // demographics section status
-        location,
-        population_no: d.population_no ?? null,
-        median_age: d.median_age ?? null,
-        households_no: d.households_no ?? null,
-        median_income_households: d.median_income_households ?? null,
-        median_income_families: d.median_income_families ?? null,
-        male_percentage: d.male_percentage ?? null,
-        female_percentage: d.female_percentage ?? null,
-        createdAt: new Date().toISOString(),
-      };
-
-      await bigquery
-        .dataset(DATASET_ID)
-        .table(JOBS_DEMOGRAPHICS_TABLE_ID)
-        .insert([demographicsRow]);
-
-      console.log(`✅ Inserted demographics for job ${jobId}`);
-
-      // 4) Update demographicsStatus in client_audits_jobs
-      await bigquery.query({
-        query: `
-          UPDATE \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-          SET
-            demographicsStatus = 'completed',
-            status = CASE
-              WHEN paidAdsStatus = 'completed' THEN 'completed'
-              ELSE status
-            END
-          WHERE jobId = @jobId
-        `,
-        params: { jobId },
-      });
-
-      console.log(`✅ Updated demographicsStatus for job ${jobId}`);
-      processedCount++;
-    } catch (err) {
-      console.error(`❌ Error processing job ${jobId}:`, err);
-      errors.push({ jobId, message: err.message });
-    }
-  }
-
-  const summary = {
-    processedJobs: processedCount,
-    skippedNoLocation,
-    skippedNoDemographics,
-    errorsCount: errors.length,
-    errors,
-  };
-
-  console.log('Demographics worker summary:', summary);
-  return summary;
-}
 
 // === Start server ===
 const port = process.env.PORT || 8080;
