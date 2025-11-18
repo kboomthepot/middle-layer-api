@@ -81,29 +81,22 @@ async function processJobDemographics(jobId) {
         `,
         params: { jobId, location },
       });
-    } else {
-      console.log(
-        `ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row.`
-      );
-      const pendingRow = {
-        jobId,
-        status: 'pending',
-        location,
-        population_no: null,
-        median_age: null,
-        households_no: null,
-        median_income_households: null,
-        median_income_families: null,
-        male_percentage: null,
-        female_percentage: null,
-        createdAt: new Date().toISOString(),
-      };
+   } else {
+  console.log(
+    `ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row via DML.`
+  );
 
-      await bigquery
-        .dataset(JOBS_DATASET_ID)
-        .table(JOBS_DEMOGRAPHICS_TABLE_ID)
-        .insert([pendingRow]);
-    }
+  // Only insert columns that definitely exist in the table schema
+  await bigquery.query({
+    query: `
+      INSERT \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_DEMOGRAPHICS_TABLE_ID}\`
+        (jobId, status, location)
+      VALUES
+        (@jobId, 'pending', @location)
+    `,
+    params: { jobId, location },
+  });
+}
 
     console.log(`⏳ [DEMOS] Marked demographics as pending for job ${jobId}`);
 
