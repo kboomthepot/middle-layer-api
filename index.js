@@ -1,3 +1,4 @@
+// index.js
 const express = require('express');
 const bodyParser = require('body-parser');
 const { BigQuery } = require('@google-cloud/bigquery');
@@ -10,29 +11,83 @@ app.use(bodyParser.json());
 // === GCP setup ===
 const PROJECT_ID = 'ghs-construction-1734441714520';
 
-// BigQuery setup
-const bigquery = new BigQuery({
-  projectId: PROJECT_ID,
-});
-
-// Pub/Sub setup
-const pubsub = new PubSub({
-  projectId: PROJECT_ID,
-});
-
-const PUBSUB_TOPIC_ID = 'client-audit-jobs';
+// BigQuery
+const bigquery = new BigQuery({ projectId: PROJECT_ID });
 
 // Dataset + main jobs table
 const DATASET_ID = 'Client_audits';
 const JOBS_TABLE_ID = 'client_audits_jobs';
+
+// (Old demographics constants left here if you still want run-demographics later)
+const DEMOGRAPHICS_SOURCE_TABLE_ID = '1_demographics';
+const JOBS_DEMOGRAPHICS_TABLE_ID = 'jobs_demographics';
+
+// Pub/Sub
+const pubsub = new PubSub({ projectId: PROJECT_ID });
+const JOB_EVENTS_TOPIC = 'client-audits-job-events';
 
 // ---------- HEALTH CHECK ----------
 app.get('/', (req, res) => {
   res.send('Middle-layer API is running');
 });
 
-// === POST /jobs - submit a new job (CREATE ONLY) ===
+// ---------- Publish job event to Pub/Sub ----------
+async function publishJobEvent(payload) {
+  const topic = pubsub.topic(JOB_EVENTS_TOPIC);
+  const dataBuffer = Buffer.from(JSON.stringify(payload));
+
+  const messageId = await topic.publishMessage({ data: dataBuffer });
+  console.log(
+    `📨 Published job ${payload.jobId} to Pub/Sub topic "${JOB_EVENTS_TOPIC}" with messageId=${messageId}`
+  );
+}
+
+// === POST /jobs - submit a new job ===
+app.post('/jobs', async (req, res) => {
+  const jobId = uuidv4();
+  const {
+    user = {},
+    business = {},
+    revenue = null,
+    budget = null,
+    services = [],
+    location = null,
+  } = req.body;
+
+  const createdAt = new Date().toISOString();
+
+  // Build row fields
+  const row = {
+    jobId,
+
+    // user fields
+    firstName: user.firstName || null,
+    lastName: user.lastName || null,
+    email: user.email || null,
+    phone: user.phone || null,
+
+    // business fields
+    businessName: business.name || null,
+    website: business.website || null,
+
+    // job context
+    services: JSON.stringify(services || []),
+    revenue,
+    budget,
+    location,
+
+    // overall job status
+    status: 'queued',
+
+    // section statuses
+    demographicsStatus: 'queued',
+    paidAdsStatus: 'queued',
+
+    createdAt,
+  };
+
   try {
+    // Use DML INSERT instead of streaming insert
     const insertQuery = `
       INSERT \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
         (jobId, firstName, lastName, email, phone,
@@ -69,8 +124,8 @@ app.get('/', (req, res) => {
 
     console.log(`✅ Job inserted successfully (DML): ${jobId}`);
 
-    // publish to Pub/Sub (what you already have)
-    await publishJobEvent({ jobId, location, createdAt: row.createdAt });
+    // Publish event so worker can pick it up
+    await publishJobEvent({ jobId, location, createdAt });
 
     res.json({
       jobId,
@@ -85,41 +140,7 @@ app.get('/', (req, res) => {
   }
 });
 
-
-    // 2) Publish Pub/Sub message so worker can process it
-    try {
-      const messageId = await pubsub
-        .topic(PUBSUB_TOPIC_ID)
-        .publishMessage({
-          json: {
-            jobId,
-            location,
-            createdAt,
-            // You can add more fields if future worker needs them
-          },
-        });
-
-      console.log(`📨 Published job ${jobId} to Pub/Sub with messageId=${messageId}`);
-    } catch (pubsubErr) {
-      // Important: log, but don't fail the API call if Pub/Sub publish has an issue
-      console.error(`⚠️ Failed to publish job ${jobId} to Pub/Sub:`, pubsubErr);
-    }
-
-    // 3) Respond to caller
-    res.json({
-      jobId,
-      status: 'queued',
-      demographicsStatus: 'queued',
-      paidAdsStatus: 'queued',
-    });
-  } catch (err) {
-    console.error('❌ BigQuery Insert Error:', err);
-    const message = err.errors ? JSON.stringify(err.errors) : err.message;
-    res.status(500).json({ error: 'Failed to insert job', details: message });
-  }
-});
-
-// === GET /status?jobId= - check job status (from jobs table only) ===
+// === GET /status?jobId= - check job status ===
 app.get('/status', async (req, res) => {
   const { jobId } = req.query;
   if (!jobId) return res.status(400).json({ error: 'jobId is required' });
@@ -190,6 +211,9 @@ app.delete('/jobs/:jobId', async (req, res) => {
     res.status(500).json({ error: 'Failed to delete job' });
   }
 });
+
+// (Optional) You can keep or remove old /run-demographics & runDemographics() here
+// since the new worker now owns demographics.
 
 // === Start server ===
 const port = process.env.PORT || 8080;
