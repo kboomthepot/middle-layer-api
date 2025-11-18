@@ -57,6 +57,7 @@ async function processJobDemographics(jobId) {
     // 2) Upsert pending row in jobs_demographics (by jobId)
     console.log('➡️ [DEMOS] Step 2: Upsert pending row into jobs_demographics');
 
+    // Check if a row already exists for this jobId
     const [existingRows] = await bigquery.query({
       query: `
         SELECT jobId
@@ -81,22 +82,22 @@ async function processJobDemographics(jobId) {
         `,
         params: { jobId, location },
       });
-   } else {
-  console.log(
-    `ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row via DML.`
-  );
+    } else {
+      console.log(
+        `ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row via DML.`
+      );
 
-  // Only insert columns that definitely exist in the table schema
-  await bigquery.query({
-    query: `
-      INSERT \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_DEMOGRAPHICS_TABLE_ID}\`
-        (jobId, status, location)
-      VALUES
-        (@jobId, 'pending', @location)
-    `,
-    params: { jobId, location },
-  });
-}
+      // Only insert fields we know exist in the table schema
+      await bigquery.query({
+        query: `
+          INSERT \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_DEMOGRAPHICS_TABLE_ID}\`
+            (jobId, status, location)
+          VALUES
+            (@jobId, 'pending', @location)
+        `,
+        params: { jobId, location },
+      });
+    }
 
     console.log(`⏳ [DEMOS] Marked demographics as pending for job ${jobId}`);
 
@@ -139,7 +140,7 @@ async function processJobDemographics(jobId) {
       console.warn(
         `⚠️ [DEMOS] No demographics found for location="${location}" (jobId=${jobId}).`
       );
-      // we leave pending so you see it's unresolved
+      // Leave status as pending so you can see it's unresolved
       return { processed: false, reason: 'no_demographics' };
     }
 
@@ -204,7 +205,7 @@ async function processJobDemographics(jobId) {
   } catch (err) {
     console.error(
       `❌ [DEMOS] Error in processJobDemographics for job ${jobId}:`,
-      err
+      JSON.stringify(err, null, 2)
     );
     throw err;
   }
@@ -216,7 +217,8 @@ app.post('/', async (req, res) => {
     const pubsubMessage = req.body?.message;
     if (!pubsubMessage || !pubsubMessage.data) {
       console.error('⚠️ No message data received', req.body);
-      return res.status(400).send('Bad Request: no message data');
+      // Ack anyway to avoid infinite retries on bad payloads
+      return res.status(204).send();
     }
 
     const payloadJson = JSON.parse(
@@ -228,7 +230,8 @@ app.post('/', async (req, res) => {
 
     if (!jobId) {
       console.error('⚠️ Missing jobId in message payload');
-      return res.status(400).send('Bad Request: missing jobId');
+      // Ack so Pub/Sub doesn't retry this forever
+      return res.status(204).send();
     }
 
     const result = await processJobDemographics(jobId);
@@ -237,10 +240,12 @@ app.post('/', async (req, res) => {
       result
     );
 
+    // Always ACK so Pub/Sub stops retrying this message
     return res.status(204).send();
   } catch (err) {
     console.error('❌ Error handling Pub/Sub message:', err);
-    return res.status(500).send('Internal Server Error');
+    // IMPORTANT: still ACK to stop the retry loop
+    return res.status(204).send();
   }
 });
 
