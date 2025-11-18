@@ -32,52 +32,59 @@ app.get('/', (req, res) => {
 });
 
 // === POST /jobs - submit a new job (CREATE ONLY) ===
-app.post('/jobs', async (req, res) => {
-  const jobId = uuidv4();
-  const {
-    user = {},
-    business = {},
-    revenue = null,
-    budget = null,
-    services = [],
-    location = null,
-  } = req.body;
-
-  const createdAt = new Date().toISOString();
-
-  const row = {
-    jobId,
-
-    // user fields
-    firstName: user.firstName || null,
-    lastName: user.lastName || null,
-    email: user.email || null,
-    phone: user.phone || null,
-
-    // business fields
-    businessName: business.name || null,
-    website: business.website || null,
-
-    // job context
-    services: JSON.stringify(services || []),
-    revenue,
-    budget,
-    location,
-
-    // overall job status
-    status: 'queued',
-
-    // section statuses (initial state)
-    demographicsStatus: 'queued',
-    paidAdsStatus: 'queued',
-
-    createdAt, // STRING or TIMESTAMP-compatible
-  };
-
   try {
-    // 1) Insert job into BigQuery
-    await bigquery.dataset(DATASET_ID).table(JOBS_TABLE_ID).insert([row]);
-    console.log(`✅ Job inserted successfully: ${jobId}`);
+    const insertQuery = `
+      INSERT \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        (jobId, firstName, lastName, email, phone,
+         businessName, website, services,
+         revenue, budget, location,
+         status, demographicsStatus, paidAdsStatus, createdAt)
+      VALUES
+        (@jobId, @firstName, @lastName, @email, @phone,
+         @businessName, @website, @services,
+         @revenue, @budget, @location,
+         @status, @demographicsStatus, @paidAdsStatus, @createdAt)
+    `;
+
+    await bigquery.query({
+      query: insertQuery,
+      params: {
+        jobId,
+        firstName: row.firstName,
+        lastName: row.lastName,
+        email: row.email,
+        phone: row.phone,
+        businessName: row.businessName,
+        website: row.website,
+        services: row.services,
+        revenue: row.revenue,
+        budget: row.budget,
+        location: row.location,
+        status: row.status,
+        demographicsStatus: row.demographicsStatus,
+        paidAdsStatus: row.paidAdsStatus,
+        createdAt: row.createdAt,
+      },
+    });
+
+    console.log(`✅ Job inserted successfully (DML): ${jobId}`);
+
+    // publish to Pub/Sub (what you already have)
+    await publishJobEvent({ jobId, location, createdAt: row.createdAt });
+
+    res.json({
+      jobId,
+      status: 'queued',
+      demographicsStatus: 'queued',
+      paidAdsStatus: 'queued',
+    });
+  } catch (err) {
+    console.error('❌ BigQuery Insert Error (DML):', err);
+    const message = err.errors ? JSON.stringify(err.errors) : err.message;
+    res.status(500).json({ error: 'Failed to insert job', details: message });
+  }
+});
+
 
     // 2) Publish Pub/Sub message so worker can process it
     try {
