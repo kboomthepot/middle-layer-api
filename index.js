@@ -70,8 +70,7 @@ app.post('/jobs', async (req, res) => {
     await bigquery.dataset(DATASET_ID).table(JOBS_TABLE_ID).insert([row]);
     console.log(`✅ Job inserted successfully: ${jobId}`);
 
-    // you can keep/remove this fake progression
-    simulateReport(jobId);
+    // ⛔ Removed fake progression: no more simulateReport(jobId)
 
     res.json({
       jobId,
@@ -301,31 +300,6 @@ async function runDemographics() {
 
   console.log('Demographics worker summary:', summary);
   return summary;
-}
-
-// === Simulate report processing (overall job status only) ===
-async function simulateReport(jobId) {
-  const statuses = ['in_progress', 'completed'];
-  const delay = 3000; // 3 seconds between updates
-
-  for (const status of statuses) {
-    await new Promise((resolve) => setTimeout(resolve, delay));
-    const query = {
-      query: `
-        UPDATE \`${bigquery.projectId}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-        SET status = @status
-        WHERE jobId = @jobId
-      `,
-      params: { jobId, status },
-    };
-
-    try {
-      await bigquery.query(query);
-      console.log(`Job ${jobId} status updated to ${status}`);
-    } catch (err) {
-      console.error(`Failed to update job status for ${jobId}:`, err);
-    }
-  }
 }
 
 // === Start server ===
