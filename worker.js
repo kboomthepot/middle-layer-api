@@ -52,48 +52,59 @@ async function processJobDemographics(jobId) {
       return { processed: false, reason: 'no_location' };
     }
 
-    // 2) Mark demographics as pending in both tables
+	// 2) Mark demographics as pending in jobs_demographics
 
-    console.log('➡️ [DEMOS] Step 2a: Delete any existing row in jobs_demographics');
-    await bigquery.query({
-      query: `
-        DELETE FROM \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_DEMOGRAPHICS_TABLE_ID}\`
-        WHERE jobId = @jobId
-      `,
-      params: { jobId },
-    });
+	console.log('➡️ [DEMOS] Step 2: Upsert pending row into jobs_demographics');
 
-    console.log('➡️ [DEMOS] Step 2b: Insert pending row into jobs_demographics');
-    const pendingRow = {
-      jobId,
-      status: 'pending',
-      location,
-      population_no: null,
-      median_age: null,
-      households_no: null,
-      median_income_households: null,
-      median_income_families: null,
-      male_percentage: null,
-      female_percentage: null,
-      createdAt: new Date().toISOString(),
-    };
+	// 2a) Check if a row already exists for this jobId
+	const [existingRows] = await bigquery.query({
+	  query: `
+		SELECT jobId
+		FROM \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_DEMOGRAPHICS_TABLE_ID}\`
+		WHERE jobId = @jobId
+		LIMIT 1
+	  `,
+	  params: { jobId },
+	});
 
-    await bigquery
-      .dataset(JOBS_DATASET_ID)
-      .table(JOBS_DEMOGRAPHICS_TABLE_ID)
-      .insert([pendingRow]);
+	if (existingRows.length) {
+	  // 2b) Row exists → just update it to pending and refresh location
+	  console.log(`ℹ️ [DEMOS] jobs_demographics row already exists for job ${jobId}, updating to pending.`);
+	  await bigquery.query({
+		query: `
+		  UPDATE \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_DEMOGRAPHICS_TABLE_ID}\`
+		  SET
+			status = 'pending',
+			location = @location
+		  WHERE jobId = @jobId
+		`,
+		params: { jobId, location },
+	  });
+	} else {
+	  // 2c) No row yet → insert a new pending row
+	  console.log(`ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row.`);
+	  const pendingRow = {
+		jobId,
+		status: 'pending',
+		location,
+		population_no: null,
+		median_age: null,
+		households_no: null,
+		median_income_households: null,
+		median_income_families: null,
+		male_percentage: null,
+		female_percentage: null,
+		createdAt: new Date().toISOString(),
+	  };
 
-    console.log(`⏳ [DEMOS] Marked demographics as pending for job ${jobId}`);
+	  await bigquery
+		.dataset(JOBS_DATASET_ID)
+		.table(JOBS_DEMOGRAPHICS_TABLE_ID)
+		.insert([pendingRow]);
+	}
 
-    console.log('➡️ [DEMOS] Step 2c: Update demographicsStatus = pending in client_audits_jobs');
-    await bigquery.query({
-      query: `
-        UPDATE \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_TABLE_ID}\`
-        SET demographicsStatus = 'pending'
-        WHERE jobId = @jobId
-      `,
-      params: { jobId },
-    });
+	console.log(`⏳ [DEMOS] Marked demographics as pending for job ${jobId}`);
+
 
     // 3) Fetch demographics row
     console.log('➡️ [DEMOS] Step 3: Fetch demographics from Client_audits_data.1_demographics');
