@@ -1,15 +1,10 @@
-// index.js
-const express = require('express');
 const { BigQuery } = require('@google-cloud/bigquery');
-
 const bigquery = new BigQuery();
 
 const PROJECT_ID = 'ghs-construction-1734441714520';
 const JOBS_TABLE = `${PROJECT_ID}.Client_audits.client_audits_jobs`;
 const JOBS_DEMOS_TABLE = `${PROJECT_ID}.Client_audits.jobs_demographics`;
 const DEMOS_SOURCE_TABLE = `${PROJECT_ID}.Client_audits_data.1_demographics`;
-
-// ---------------- CORE LOGIC (unchanged) ----------------
 
 async function processJobDemographics(jobId, locationFromMessage) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
@@ -87,8 +82,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
         `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics:`,
         JSON.stringify(err.errors || err, null, 2)
       );
-      // Let caller decide how to handle retry; do NOT process.exit
-      throw err;
+      throw err; // Let Pub/Sub retry
     }
   } else {
     console.log(
@@ -126,6 +120,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
       `Marking jobs_demographics + job as no_data.`
     );
 
+    // Mark demographicsStatus / status accordingly if you want:
     await bigquery.query({
       query: `
         UPDATE \`${JOBS_DEMOS_TABLE}\`
@@ -231,62 +226,6 @@ async function processJobDemographics(jobId, locationFromMessage) {
       `❌ [DEMOS] Error updating jobs_demographics for job ${jobId}:`,
       JSON.stringify(err.errors || err, null, 2)
     );
-    throw err;
+    throw err; // Let Pub/Sub retry if something went wrong
   }
 }
-
-// ---------------- EXPRESS SERVER FOR CLOUD RUN ----------------
-
-const app = express();
-app.use(express.json());
-
-const PORT = process.env.PORT || 8080;
-
-// Health / readiness probe
-app.get('/', (req, res) => {
-  res.status(200).send('client-audits-worker OK');
-});
-
-// Main endpoint – supports both Pub/Sub push and direct JSON
-app.post('/process', async (req, res) => {
-  try {
-    let jobId;
-    let locationFromMessage;
-
-    // 1) Pub/Sub push format: { message: { data: "base64" } }
-    if (req.body && req.body.message && req.body.message.data) {
-      const dataBuffer = Buffer.from(req.body.message.data, 'base64');
-      const payload = JSON.parse(dataBuffer.toString());
-      jobId = payload.jobId;
-      locationFromMessage = payload.location || payload.locationFromMessage || null;
-      console.log('📩 Received Pub/Sub payload:', payload);
-
-    // 2) Direct JSON call: { jobId: "...", location: "..." }
-    } else if (req.body && req.body.jobId) {
-      jobId = req.body.jobId;
-      locationFromMessage = req.body.location || req.body.locationFromMessage || null;
-      console.log('📩 Received direct JSON payload:', req.body);
-    }
-
-    if (!jobId) {
-      console.error('❌ [DEMOS] Missing jobId in request body');
-      return res.status(400).json({ error: 'jobId is required' });
-    }
-
-    await processJobDemographics(jobId, locationFromMessage);
-    // For Pub/Sub, 204 is recommended; 200 is also fine for direct calls
-    res.status(204).send();
-  } catch (err) {
-    console.error('❌ [DEMOS] Error in /process handler:', err);
-    // Don’t crash the container – just return 500 so Pub/Sub can retry
-    res.status(500).json({ error: 'Internal error', details: String(err) });
-  }
-});
-
-// Start listening – this prevents "Container called exit(0)" and satisfies Cloud Run
-app.listen(PORT, () => {
-  console.log(`🚀 client-audits-worker listening on port ${PORT}`);
-});
-
-// Optional: export for tests
-module.exports = { processJobDemographics };
