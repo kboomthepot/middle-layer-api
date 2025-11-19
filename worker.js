@@ -126,7 +126,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
 
   console.log(
     `ℹ️ [DEMOS] Job ${jobId} location = "${location}", ` +
-    `demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${job.paidAdsStatus}`
+    `demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${job.paidAdsStatus}, status = ${job.status}`
   );
 
   if (!location) {
@@ -165,38 +165,66 @@ async function processJobDemographics(jobId, locationFromMessage) {
     );
   } else {
     console.log(
-      `ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row.`
+      `ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row via DML.`
     );
 
-    const pendingRow = {
-      jobId,
-      status: 'pending',
-      location,
-      population_no: null,
-      median_age: null,
-      median_income_households: null,
-      median_income_families: null,
-      male_percentage: null,
-      female_percentage: null,
-      createdAt: new Date().toISOString()
-    };
-
     try {
-      await bigquery
-        .dataset(DATASET_ID)
-        .table(JOBS_DEMOS_TABLE_ID)
-        .insert([pendingRow], { ignoreUnknownValues: true });
+      const [insertJob] = await bigquery.createQueryJob({
+        query: `
+          INSERT \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+            (jobId, status, location, population_no, median_age,
+             median_income_households, median_income_families,
+             male_percentage, female_percentage, createdAt)
+          VALUES
+            (@jobId, 'pending', @location, NULL, NULL,
+             NULL, NULL, NULL, NULL, CURRENT_TIMESTAMP())
+        `,
+        params: { jobId, location }
+      });
+
+      const [insertMeta] = await insertJob.getMetadata();
+      const dmlStats =
+        insertMeta.statistics &&
+        insertMeta.statistics.query &&
+        insertMeta.statistics.query.dmlStats;
+      const insertedRows = dmlStats ? dmlStats.insertedRowCount : 'unknown';
 
       console.log(
-        `✅ [DEMOS] Inserted pending demographics row for job ${jobId} into ${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}`
+        `✅ [DEMOS] Inserted pending demographics row for job ${jobId} (insertedRowCount=${insertedRows})`
       );
     } catch (err) {
       console.error(
-        `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics:`,
+        `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics (DML):`,
         JSON.stringify(err.errors || err, null, 2)
       );
       return; // don't continue if we can't create the row
     }
+  }
+
+  // At the end of Step 2, mark main job's overall status = 'pending'
+  try {
+    const [pendingJob] = await bigquery.createQueryJob({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET status = 'pending'
+        WHERE jobId = @jobId
+      `,
+      params: { jobId }
+    });
+    const [pendingMeta] = await pendingJob.getMetadata();
+    const dmlStatsPending =
+      pendingMeta.statistics &&
+      pendingMeta.statistics.query &&
+      pendingMeta.statistics.query.dmlStats;
+    const updatedPending = dmlStatsPending ? dmlStatsPending.updatedRowCount : 'unknown';
+    console.log(
+      `ℹ️ [DEMOS] Step 2: Updated main job status to 'pending' for job ${jobId} (updatedRowCount=${updatedPending}).`
+    );
+  } catch (err) {
+    console.error(
+      `❌ [DEMOS] Failed to update main job status to 'pending' for job ${jobId}:`,
+      JSON.stringify(err.errors || err, null, 2)
+    );
   }
 
   // ---- Step 3: Load demographics source row from Client_audits_data.1_demographics ----
@@ -292,7 +320,19 @@ async function processJobDemographics(jobId, locationFromMessage) {
     female_percentage: toNumberOrNull(demo.female_percentage)
   };
 
+  const allMetricsPresent = [
+    updateParams.population_no,
+    updateParams.median_age,
+    updateParams.median_income_households,
+    updateParams.median_income_families,
+    updateParams.male_percentage,
+    updateParams.female_percentage
+  ].every(v => v !== null);
+
+  const newStatus = allMetricsPresent ? 'completed' : 'partial';
+
   console.log('ℹ️ [DEMOS] Step 4 params:', JSON.stringify(updateParams, null, 2));
+  console.log(`ℹ️ [DEMOS] Step 4 newStatus for job ${jobId}: ${newStatus}`);
 
   try {
     // Run UPDATE as a query job so we can inspect DML stats
@@ -306,10 +346,10 @@ async function processJobDemographics(jobId, locationFromMessage) {
           median_income_families = @median_income_families,
           male_percentage = @male_percentage,
           female_percentage = @female_percentage,
-          status = 'completed'
+          status = @status
         WHERE jobId = @jobId
       `,
-      params: updateParams
+      params: { ...updateParams, status: newStatus }
     });
 
     const [metadata] = await jobObj.getMetadata();
