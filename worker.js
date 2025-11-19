@@ -295,7 +295,8 @@ async function processJobDemographics(jobId, locationFromMessage) {
   console.log('ℹ️ [DEMOS] Step 4 params:', JSON.stringify(updateParams, null, 2));
 
   try {
-    await bigquery.query({
+    // Run UPDATE as a query job so we can inspect DML stats
+    const [jobObj] = await bigquery.createQueryJob({
       query: `
         UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
         SET
@@ -311,8 +312,38 @@ async function processJobDemographics(jobId, locationFromMessage) {
       params: updateParams
     });
 
+    const [metadata] = await jobObj.getMetadata();
+    const dmlStats =
+      metadata.statistics &&
+      metadata.statistics.query &&
+      metadata.statistics.query.dmlStats;
+    const updatedRows = dmlStats ? dmlStats.updatedRowCount : 'unknown';
+
     console.log(
-      `✅ [DEMOS] Updated jobs_demographics row for job ${jobId} with demographics data`
+      `✅ [DEMOS] UPDATE jobs_demographics completed for job ${jobId}. updatedRowCount=${updatedRows}`
+    );
+
+    // Re-select the row to see exactly what is stored now
+    const [checkRows] = await bigquery.query({
+      query: `
+        SELECT jobId, location,
+               population_no,
+               median_age,
+               median_income_households,
+               median_income_families,
+               male_percentage,
+               female_percentage,
+               status
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+        WHERE jobId = @jobId
+        LIMIT 1
+      `,
+      params: { jobId }
+    });
+
+    console.log(
+      `ℹ️ [DEMOS] Step 4 check row for job ${jobId}:`,
+      JSON.stringify(checkRows[0] || null, null, 2)
     );
   } catch (err) {
     console.error(
@@ -355,7 +386,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
   );
 
   try {
-    await bigquery.query({
+    const [statusJob] = await bigquery.createQueryJob({
       query: `
         UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
         SET demographicsStatus = 'completed'
@@ -364,8 +395,15 @@ async function processJobDemographics(jobId, locationFromMessage) {
       params: { jobId }
     });
 
+    const [statusMeta] = await statusJob.getMetadata();
+    const dmlStats2 =
+      statusMeta.statistics &&
+      statusMeta.statistics.query &&
+      statusMeta.statistics.query.dmlStats;
+    const updatedRows2 = dmlStats2 ? dmlStats2.updatedRowCount : 'unknown';
+
     console.log(
-      `✅ [DEMOS] Marked demographicsStatus = completed for job ${jobId}`
+      `✅ [DEMOS] Marked demographicsStatus = completed for job ${jobId} (updatedRowCount=${updatedRows2})`
     );
   } catch (err) {
     console.error(
