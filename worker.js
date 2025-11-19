@@ -54,7 +54,8 @@ app.post('/', async (req, res) => {
       return res.status(204).send();
     }
 
-    await processJobDemographics(jobId, locationFromMessage || null);
+    // pass createdAt into the worker as well
+    await processJobDemographics(jobId, locationFromMessage || null, createdAt || null);
 
     // Always ACK so Pub/Sub does not retry this message
     res.status(204).send();
@@ -67,7 +68,7 @@ app.post('/', async (req, res) => {
 
 // ---------- DEMOGRAPHICS PROCESSOR ----------
 
-async function processJobDemographics(jobId, locationFromMessage = null) {
+async function processJobDemographics(jobId, locationFromMessage = null, createdAtFromMessage = null) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
   // ---- Step 1: Load job row from client_audits_jobs ----
@@ -80,7 +81,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
         location,
         demographicsStatus,
         paidAdsStatus,
-        status
+        status,
+        createdAt
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -101,8 +103,18 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const paidAdsStatus = job.paidAdsStatus || null;
   const location = job.location || locationFromMessage || null;
 
+  // Normalize createdAt: prefer table value, then message, then now
+  let jobCreatedAtIso;
+  if (job.createdAt) {
+    jobCreatedAtIso = new Date(job.createdAt).toISOString();
+  } else if (createdAtFromMessage) {
+    jobCreatedAtIso = new Date(createdAtFromMessage).toISOString();
+  } else {
+    jobCreatedAtIso = new Date().toISOString();
+  }
+
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}`
+    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt=${jobCreatedAtIso}`
   );
 
   if (!location) {
@@ -110,8 +122,9 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       `⚠️ [DEMOS] Job ${jobId} has no location; cannot process demographics.`
     );
 
-    // Mark main job as failed for demographics
+    // Mark main job as failed for demographics and recompute main status
     await markJobDemographicsStatus(jobId, 'failed');
+    await recomputeMainJobStatus(jobId);
     return;
   }
 
@@ -140,6 +153,9 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     );
     // don't hard-fail, continue to try demographics
   }
+
+  // Recompute main status after we switch demographicsStatus to pending
+  await recomputeMainJobStatus(jobId);
 
   // ---- Step 3: Load demographics source row ----
   console.log(
@@ -171,19 +187,24 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     );
 
     // Delete any existing row, then insert a "failed" row with nulls
-    await overwriteJobsDemographicsRow(jobId, {
+    await overwriteJobsDemographicsRow(
       jobId,
-      location,
-      population_no: null,
-      median_age: null,
-      median_income_households: null,
-      median_income_families: null,
-      male_percentage: null,
-      female_percentage: null,
-      status: 'failed',
-    });
+      {
+        jobId,
+        location,
+        population_no: null,
+        median_age: null,
+        median_income_households: null,
+        median_income_families: null,
+        male_percentage: null,
+        female_percentage: null,
+        status: 'failed',
+      },
+      jobCreatedAtIso
+    );
 
     await markJobDemographicsStatus(jobId, 'failed');
+    await recomputeMainJobStatus(jobId);
     return;
   }
 
@@ -264,6 +285,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     male_percentage: parsed.male_percentage,
     female_percentage: parsed.female_percentage,
     status: newDemoStatus,
+    // 👇 this is the job's creation time from client_audits_jobs
+    date: jobCreatedAtIso,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
@@ -288,8 +311,9 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       JSON.stringify(err.errors || err, null, 2)
     );
 
-    // If insert fails, mark main job as failed
+    // If insert fails, mark main job as failed and recompute main status
     await markJobDemographicsStatus(jobId, 'failed');
+    await recomputeMainJobStatus(jobId);
     return;
   }
 
@@ -306,7 +330,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
           median_income_families,
           male_percentage,
           female_percentage,
-          status
+          status,
+          date
         FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
         WHERE jobId = @jobId
         LIMIT 1
@@ -314,10 +339,22 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       params: { jobId },
     });
 
-    console.log(
-      `ℹ️ [DEMOS] Step 4 check row for job ${jobId}:`,
-      checkRows[0] || null
-    );
+    const r = checkRows[0] || null;
+    if (r) {
+      console.log(
+        `ℹ️ [DEMOS] Step 4 check row for job ${jobId}:`,
+        {
+          jobId: r.jobId,
+          location: r.location,
+          population_no: r.population_no?.toString?.() ?? r.population_no,
+          median_age: r.median_age?.toString?.() ?? r.median_age,
+          status: r.status,
+          date: r.date,
+        }
+      );
+    } else {
+      console.log(`ℹ️ [DEMOS] Step 4 check row for job ${jobId}: null`);
+    }
   } catch (err) {
     console.error(
       `❌ [DEMOS] Error verifying jobs_demographics row for job ${jobId}:`,
@@ -330,36 +367,10 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
 
   await markJobDemographicsStatus(jobId, newDemoStatus);
 
-  // ---- Step 6: Optionally update main job.status if all segments done ----
-  console.log(
-    '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
-  );
+  // ---- Step 6: Recompute main job.status based on all segment statuses ----
+  console.log('➡️ [DEMOS] Step 6: Recompute main job.status from segment statuses');
 
-  try {
-    if (newDemoStatus === 'completed' && paidAdsStatus === 'completed') {
-      const [statusJob] = await bigquery.createQueryJob({
-        query: `
-          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-          SET status = 'completed'
-          WHERE jobId = @jobId
-        `,
-        params: { jobId },
-      });
-      await statusJob.getQueryResults();
-      console.log(
-        `ℹ️ [DEMOS] Step 6: Marked main job status='completed' for job ${jobId} (both demographics + paidAds completed).`
-      );
-    } else {
-      console.log(
-        `ℹ️ [DEMOS] Step 6: Main job status NOT set to completed for job ${jobId} (demoStatus=${newDemoStatus}, paidAdsStatus=${paidAdsStatus}).`
-      );
-    }
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error updating main job status for job ${jobId}:`,
-      err
-    );
-  }
+  await recomputeMainJobStatus(jobId);
 }
 
 // ---------- HELPERS ----------
@@ -394,7 +405,95 @@ async function markJobDemographicsStatus(jobId, demoStatus) {
   }
 }
 
-async function overwriteJobsDemographicsRow(jobId, data) {
+/**
+ * Recompute main job.status from all sub-statuses (demographicsStatus, paidAdsStatus, etc.)
+ *
+ * Rules:
+ * - If ANY sub-status = 'failed' → main status = 'failed'
+ * - ELSE if ANY sub-status in ('pending', 'partial') → main status = 'pending'
+ * - ELSE if ALL known sub-statuses = 'completed' → main status = 'completed'
+ * - ELSE (everything queued/null) → main status = 'queued'
+ */
+async function recomputeMainJobStatus(jobId) {
+  try {
+    const [rows] = await bigquery.query({
+      query: `
+        SELECT
+          demographicsStatus,
+          paidAdsStatus,
+          status
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        WHERE jobId = @jobId
+        LIMIT 1
+      `,
+      params: { jobId },
+    });
+
+    if (!rows.length) {
+      console.warn(
+        `⚠️ [DEMOS] recomputeMainJobStatus: job ${jobId} not found.`
+      );
+      return;
+    }
+
+    const row = rows[0];
+    const demo = row.demographicsStatus || null;
+    const paid = row.paidAdsStatus || null;
+
+    const subStatuses = [demo, paid].filter(Boolean);
+
+    let newMainStatus;
+
+    if (subStatuses.length === 0) {
+      newMainStatus = 'queued';
+    } else if (subStatuses.includes('failed')) {
+      newMainStatus = 'failed';
+    } else if (
+      subStatuses.includes('pending') ||
+      subStatuses.includes('partial')
+    ) {
+      newMainStatus = 'pending';
+    } else if (subStatuses.every((s) => s === 'completed')) {
+      newMainStatus = 'completed';
+    } else {
+      newMainStatus = 'queued';
+    }
+
+    console.log(
+      `ℹ️ [DEMOS] recomputeMainJobStatus for job ${jobId}: sub-statuses=${JSON.stringify(
+        subStatuses
+      )} => newMainStatus=${newMainStatus}`
+    );
+
+    if (row.status === newMainStatus) {
+      console.log(
+        `ℹ️ [DEMOS] recomputeMainJobStatus: main status already '${newMainStatus}' for job ${jobId}, no update needed.`
+      );
+      return;
+    }
+
+    const [updateJob] = await bigquery.createQueryJob({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET status = @newStatus
+        WHERE jobId = @jobId
+      `,
+      params: { jobId, newStatus: newMainStatus },
+    });
+
+    await updateJob.getQueryResults();
+    console.log(
+      `✅ [DEMOS] recomputeMainJobStatus: updated main status to '${newMainStatus}' for job ${jobId}`
+    );
+  } catch (err) {
+    console.error(
+      `❌ [DEMOS] Error in recomputeMainJobStatus for job ${jobId}:`,
+      err
+    );
+  }
+}
+
+async function overwriteJobsDemographicsRow(jobId, data, jobCreatedAtIso = null) {
   // Convenience for "no data" case
   const nowIso = new Date().toISOString();
   const row = {
@@ -407,6 +506,8 @@ async function overwriteJobsDemographicsRow(jobId, data) {
     male_percentage: data.male_percentage ?? null,
     female_percentage: data.female_percentage ?? null,
     status: data.status || 'failed',
+    // ensure we also store the original job createdAt as "date"
+    date: jobCreatedAtIso || null,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
