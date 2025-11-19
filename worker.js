@@ -1,106 +1,178 @@
-async function processJobDemographics(jobId, locationFromMessage) {
+// worker.js
+const express = require('express');
+const bodyParser = require('body-parser');
+const { BigQuery } = require('@google-cloud/bigquery');
+
+// ---------- CONFIG ----------
+const PROJECT_ID = 'ghs-construction-1734441714520';
+
+// Main jobs table (source)
+const DATASET_ID = 'Client_audits';
+const JOBS_TABLE_ID = 'client_audits_jobs';
+
+// Demographics data source
+const DEMOS_DATASET_ID = 'Client_audits_data';
+const DEMOS_SOURCE_TABLE_ID = '1_demographics';
+
+// Demographics jobs table (target)
+const JOBS_DEMOS_TABLE_ID = 'jobs_demographics';
+
+const bigquery = new BigQuery({ projectId: PROJECT_ID });
+
+const app = express();
+app.use(bodyParser.json());
+
+// Simple health check
+app.get('/', (req, res) => {
+  res.send('Worker service listening on port 8080');
+});
+
+// Pub/Sub push endpoint
+app.post('/', async (req, res) => {
+  try {
+    const envelope = req.body;
+    if (!envelope || !envelope.message || !envelope.message.data) {
+      console.error('❌ Invalid Pub/Sub message format:', JSON.stringify(envelope));
+      // ACK anyway so Pub/Sub doesn’t retry forever
+      return res.status(204).send();
+    }
+
+    const payload = JSON.parse(
+      Buffer.from(envelope.message.data, 'base64').toString()
+    );
+
+    console.log('📩 Received job message:', payload);
+
+    const { jobId, location, createdAt } = payload;
+
+    console.log(
+      `✅ Worker received job ${jobId} (location=${location || 'N/A'})`
+    );
+
+    if (!jobId) {
+      console.error('❌ [DEMOS] Missing jobId in message payload. Skipping.');
+      return res.status(204).send();
+    }
+
+    await processJobDemographics(jobId);
+
+    // Always ACK so Pub/Sub does not retry this message
+    res.status(204).send();
+  } catch (err) {
+    console.error('❌ Error handling Pub/Sub message:', err);
+    // ACK even on error to avoid infinite retry loop
+    res.status(204).send();
+  }
+});
+
+// -------- DEMOGRAPHICS PROCESSOR --------
+
+async function processJobDemographics(jobId) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
-  // STEP 1: Load job row
+  // ---- Step 1: Load job row from client_audits_jobs ----
   console.log('➡️ [DEMOS] Step 1: Load job row from client_audits_jobs');
+
   const [jobRows] = await bigquery.query({
     query: `
-      SELECT jobId, location, demographicsStatus, paidAdsStatus
-      FROM \`${JOBS_TABLE}\`
+      SELECT
+        jobId,
+        location,
+        demographicsStatus,
+        paidAdsStatus,
+        status
+      FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
+      LIMIT 1
     `,
-    params: { jobId }
+    params: { jobId },
   });
 
   console.log(`ℹ️ [DEMOS] Step 1 result rows: ${jobRows.length}`);
+
   if (!jobRows.length) {
-    console.log(`⚠️ [DEMOS] No job row found in client_audits_jobs for jobId=${jobId}`);
+    console.warn(
+      `⚠️ [DEMOS] Job ${jobId} not found in ${DATASET_ID}.${JOBS_TABLE_ID}.`
+    );
     return;
   }
 
-  const jobRow = jobRows[0];
-  const jobLocation = jobRow.location || locationFromMessage;
+  const job = jobRows[0];
+  const location = job.location || null;
 
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${jobLocation}", ` +
-    `demographicsStatus = ${jobRow.demographicsStatus}, paidAdsStatus = ${jobRow.paidAdsStatus}`
+    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${job.paidAdsStatus}`
   );
 
-  // STEP 2: Ensure pending row exists in jobs_demographics
-  console.log('➡️ [DEMOS] Step 2: Upsert pending row into jobs_demographics');
-  const [existingDemoRows] = await bigquery.query({
+  if (!location) {
+    console.warn(
+      `⚠️ [DEMOS] Job ${jobId} has no location; cannot process demographics.`
+    );
+    return;
+  }
+
+  // ---- Step 2: Upsert pending row into jobs_demographics ----
+  console.log(
+    '➡️ [DEMOS] Step 2: Upsert pending row into jobs_demographics'
+  );
+
+  const [existingRows] = await bigquery.query({
     query: `
       SELECT jobId
-      FROM \`${JOBS_DEMOS_TABLE}\`
+      FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
       WHERE jobId = @jobId
+      LIMIT 1
     `,
-    params: { jobId }
+    params: { jobId },
   });
 
-  if (!existingDemoRows.length) {
+  if (existingRows.length > 0) {
+    console.log(
+      `ℹ️ [DEMOS] jobs_demographics already has row for job ${jobId}; will not insert duplicate.`
+    );
+  } else {
     console.log(
       `ℹ️ [DEMOS] No jobs_demographics row for job ${jobId}, inserting pending row.`
     );
 
-    const nowIso = new Date().toISOString();
+    const pendingRow = {
+      jobId,
+      status: 'pending',
+      location,
+      population_no: null,
+      median_age: null,
+      // households_no: null, // <- not in jobs_demographics schema (yet)
+      median_income_households: null,
+      median_income_families: null,
+      male_percentage: null,
+      female_percentage: null,
+      createdAt: new Date().toISOString(),
+    };
 
     try {
-      await bigquery.dataset('Client_audits')
-        .table('jobs_demographics')
-        .insert([{
-          jobId,
-          status: 'pending',
-          location: jobLocation,
-          population_no: null,
-          median_age: null,
-          households_no: null,
-          median_income_households: null,
-          median_income_families: null,
-          male_percentage: null,
-          female_percentage: null,
-          createdAt: nowIso,
-          updatedAt: nowIso
-        }]);
+      await bigquery
+        .dataset(DATASET_ID)
+        .table(JOBS_DEMOS_TABLE_ID)
+        .insert([pendingRow], {
+          ignoreUnknownValues: true, // safety
+        });
 
       console.log(
-        `✅ [DEMOS] Inserted pending demographics row for job ${jobId} into Client_audits.jobs_demographics`
+        `✅ [DEMOS] Inserted pending demographics row for job ${jobId} into ${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}`
       );
     } catch (err) {
       console.error(
         `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics:`,
         JSON.stringify(err.errors || err, null, 2)
       );
-
-      // Mark error on main job + demo table instead of throwing
-      await bigquery.query({
-        query: `
-          UPDATE \`${JOBS_DEMOS_TABLE}\`
-          SET status = 'error', updatedAt = CURRENT_TIMESTAMP()
-          WHERE jobId = @jobId
-        `,
-        params: { jobId }
-      }).catch(e => console.error('⚠️ [DEMOS] Failed to mark jobs_demographics error:', e));
-
-      await bigquery.query({
-        query: `
-          UPDATE \`${JOBS_TABLE}\`
-          SET demographicsStatus = 'error', updatedAt = CURRENT_TIMESTAMP()
-          WHERE jobId = @jobId
-        `,
-        params: { jobId }
-      }).catch(e => console.error('⚠️ [DEMOS] Failed to mark client_audits_jobs error:', e));
-
-      // Stop processing this job, but DO NOT throw → Pub/Sub won't retry forever
-      return;
+      return; // don't continue if we can't create the row
     }
-  } else {
-    console.log(
-      `ℹ️ [DEMOS] jobs_demographics row already exists for job ${jobId}, will update it.`
-    );
   }
 
-  // STEP 3: Load demographics from source table (unchanged except for error logic)
-  console.log('➡️ [DEMOS] Step 3: Load demographics from Client_audits_data.1_demographics');
+  // ---- Step 3: Load demographics source row from Client_audits_data.1_demographics ----
+  console.log(
+    '➡️ [DEMOS] Step 3: Load demographics from Client_audits_data.1_demographics'
+  );
 
   const [demoRows] = await bigquery.query({
     query: `
@@ -112,38 +184,38 @@ async function processJobDemographics(jobId, locationFromMessage) {
         median_income_families,
         male_percentage,
         female_percentage
-      FROM \`${DEMOS_SOURCE_TABLE}\`
+      FROM \`${PROJECT_ID}.${DEMOS_DATASET_ID}.${DEMOS_SOURCE_TABLE_ID}\`
       WHERE location = @location
       LIMIT 1
     `,
-    params: { location: jobLocation }
+    params: { location },
   });
 
   console.log(`ℹ️ [DEMOS] Step 3 result rows (demographics): ${demoRows.length}`);
 
   if (!demoRows.length) {
-    console.log(
-      `⚠️ [DEMOS] No demographics row found for "${jobLocation}" in 1_demographics. ` +
-      `Marking jobs_demographics + job as no_data.`
+    console.warn(
+      `⚠️ [DEMOS] No demographics found in ${DEMOS_DATASET_ID}.${DEMOS_SOURCE_TABLE_ID} for location "${location}". Marking as no_data.`
     );
 
+    // Mark jobs_demographics + job as no_data
     await bigquery.query({
       query: `
-        UPDATE \`${JOBS_DEMOS_TABLE}\`
-        SET status = 'no_data', updatedAt = CURRENT_TIMESTAMP()
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+        SET status = 'no_data'
         WHERE jobId = @jobId
       `,
-      params: { jobId }
-    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark jobs_demographics no_data:', e));
+      params: { jobId },
+    });
 
     await bigquery.query({
       query: `
-        UPDATE \`${JOBS_TABLE}\`
-        SET demographicsStatus = 'no_data', updatedAt = CURRENT_TIMESTAMP()
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET demographicsStatus = 'no_data'
         WHERE jobId = @jobId
       `,
-      params: { jobId }
-    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark client_audits_jobs no_data:', e));
+      params: { jobId },
+    });
 
     return;
   }
@@ -151,102 +223,84 @@ async function processJobDemographics(jobId, locationFromMessage) {
   const demo = demoRows[0];
 
   console.log(
-    `ℹ️ [DEMOS] Found demographics for "${jobLocation}": ` +
-    JSON.stringify(demo)
+    `ℹ️ [DEMOS] Found demographics for "${location}": ` +
+      JSON.stringify(demo)
   );
 
-  // STEP 4: Update jobs_demographics
-  console.log('➡️ [DEMOS] Step 4: Update jobs_demographics with demographics values');
+  // ---- Step 4: Update jobs_demographics row with actual values ----
+  console.log(
+    '➡️ [DEMOS] Step 4: Update jobs_demographics with demographics values'
+  );
 
-  const updateParams = {
-    jobId,
-    population_no: demo.population_no != null && demo.population_no !== ''
-      ? Number(demo.population_no)
-      : null,
-    median_age: demo.median_age != null && demo.median_age !== ''
-      ? Number(demo.median_age)
-      : null,
-    households_no: demo.households_no != null && demo.households_no !== ''
-      ? Number(demo.households_no)
-      : null,
-    median_income_households:
-      demo.median_income_households != null && demo.median_income_households !== ''
-        ? Number(demo.median_income_households)
-        : null,
-    median_income_families:
-      demo.median_income_families != null && demo.median_income_families !== ''
-        ? Number(demo.median_income_families)
-        : null,
-    male_percentage: demo.male_percentage != null && demo.male_percentage !== ''
-      ? Number(demo.male_percentage)
-      : null,
-    female_percentage: demo.female_percentage != null && demo.female_percentage !== ''
-      ? Number(demo.female_percentage)
-      : null
-  };
+  await bigquery.query({
+    query: `
+      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+      SET
+        population_no = @population_no,
+        median_age = @median_age,
+        median_income_households = @median_income_households,
+        median_income_families = @median_income_families,
+        male_percentage = @male_percentage,
+        female_percentage = @female_percentage,
+        status = 'completed'
+      WHERE jobId = @jobId
+    `,
+    params: {
+      jobId,
+      population_no: demo.population_no ?? null,
+      median_age: demo.median_age ?? null,
+      median_income_households: demo.median_income_households ?? null,
+      median_income_families: demo.median_income_families ?? null,
+      male_percentage: demo.male_percentage ?? null,
+      female_percentage: demo.female_percentage ?? null,
+    },
+  });
 
-  console.log('ℹ️ [DEMOS] Step 4 params:', JSON.stringify(updateParams, null, 2));
+  console.log(
+    `✅ [DEMOS] Updated jobs_demographics row for job ${jobId} with demographics data`
+  );
 
-  try {
-    const [updateJob] = await bigquery.createQueryJob({
-      query: `
-        UPDATE \`${JOBS_DEMOS_TABLE}\`
-        SET
-          population_no = @population_no,
-          median_age = @median_age,
-          households_no = @households_no,
-          median_income_households = @median_income_households,
-          median_income_families = @median_income_families,
-          male_percentage = @male_percentage,
-          female_percentage = @female_percentage,
-          status = 'completed',
-          updatedAt = CURRENT_TIMESTAMP()
-        WHERE jobId = @jobId
-      `,
-      params: updateParams
-    });
+  // ---- Step 5: Update job's demographicsStatus in main table ----
+  console.log(
+    '➡️ [DEMOS] Step 5: Update client_audits_jobs.demographicsStatus'
+  );
 
-    await updateJob.getQueryResults();
+  await bigquery.query({
+    query: `
+      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      SET demographicsStatus = 'completed'
+      WHERE jobId = @jobId
+    `,
+    params: { jobId },
+  });
 
-    console.log(`✅ [DEMOS] Updated jobs_demographics for job ${jobId}.`);
+  console.log(
+    `✅ [DEMOS] Marked demographicsStatus = completed for job ${jobId}`
+  );
 
-    // STEP 5: Mark main job as completed
-    await bigquery.createQueryJob({
-      query: `
-        UPDATE \`${JOBS_TABLE}\`
-        SET demographicsStatus = 'completed', updatedAt = CURRENT_TIMESTAMP()
-        WHERE jobId = @jobId
-      `,
-      params: { jobId }
-    });
+  // ---- Step 6: Optionally update main status if all segments done ----
+  console.log(
+    '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
+  );
 
-    console.log(`✅ [DEMOS] Marked demographicsStatus=completed for job ${jobId} in client_audits_jobs`);
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error updating jobs_demographics for job ${jobId}:`,
-      JSON.stringify(err.errors || err, null, 2)
-    );
+  await bigquery.query({
+    query: `
+      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      SET status = 'completed'
+      WHERE jobId = @jobId
+        AND demographicsStatus = 'completed'
+        AND paidAdsStatus = 'completed'
+    `,
+    params: { jobId },
+  });
 
-    // Mark as error instead of throwing so Pub/Sub doesn't retry forever
-    await bigquery.query({
-      query: `
-        UPDATE \`${JOBS_DEMOS_TABLE}\`
-        SET status = 'error', updatedAt = CURRENT_TIMESTAMP()
-        WHERE jobId = @jobId
-      `,
-      params: { jobId }
-    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark jobs_demographics error (update step):', e));
-
-    await bigquery.query({
-      query: `
-        UPDATE \`${JOBS_TABLE}\`
-        SET demographicsStatus = 'error', updatedAt = CURRENT_TIMESTAMP()
-        WHERE jobId = @jobId
-      `,
-      params: { jobId }
-    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark client_audits_jobs error (update step):', e));
-
-    // Do NOT throw here → handler can return 204
-    return;
-  }
+  console.log(
+    `ℹ️ [DEMOS] Step 6 checked for full completion for job ${jobId}.`
+  );
 }
+
+// ---------- START SERVER ----------
+const port = process.env.PORT || 8080;
+app.listen(port, () => {
+  console.log(`Worker service listening on port ${port}`);
+});
