@@ -43,7 +43,7 @@ app.post('/', async (req, res) => {
 
     console.log('📩 Received job message:', payload);
 
-    const { jobId, location: locationFromMessage, createdAt } = payload;
+    const { jobId, location: locationFromMessage } = payload;
 
     console.log(
       `✅ Worker received job ${jobId} (location=${locationFromMessage || 'N/A'})`
@@ -99,13 +99,27 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   }
 
   const job = jobRows[0];
+  const currentDemoStatus = job.demographicsStatus || 'queued';
   const paidAdsStatus = job.paidAdsStatus || null;
   const location = job.location || locationFromMessage || null;
-  const jobTimestamp = job.createdAt || null; // used for jobs_demographics.timestamp
+
+  // createdAt is a BigQuery TIMESTAMP object; normalise to ISO string
+  const jobTimestamp =
+    job.createdAt && job.createdAt.value
+      ? job.createdAt.value
+      : job.createdAt || null;
 
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt=${jobTimestamp}`
+    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${currentDemoStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt=${jobTimestamp}`
   );
+
+  // ✅ Idempotency guard: if this job is already terminal, don't reprocess
+  if (currentDemoStatus === 'completed' || currentDemoStatus === 'failed') {
+    console.log(
+      `ℹ️ [DEMOS] Job ${jobId} already has demographicsStatus="${currentDemoStatus}". Skipping re-processing.`
+    );
+    return;
+  }
 
   if (!location) {
     console.warn(
@@ -249,7 +263,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     male_percentage: parsed.male_percentage,
     female_percentage: parsed.female_percentage,
     status: newDemoStatus,
-    timestamp: jobTimestamp || null, // must match job date from main table
+    timestamp: jobTimestamp || null, // match job date from main table
     createdAt: nowIso,
     updatedAt: nowIso,
   };
@@ -279,7 +293,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     return;
   }
 
-  // Quick verification: should see the just-inserted row (including households_no, timestamp, etc.)
+  // Quick verification
   try {
     const [checkRows] = await bigquery.query({
       query: `
@@ -446,7 +460,10 @@ async function overwriteJobsDemographicsRow(jobId, data) {
     male_percentage: data.male_percentage ?? null,
     female_percentage: data.female_percentage ?? null,
     status: data.status || 'failed',
-    timestamp: data.timestamp || null,
+    timestamp:
+      data.timestamp && data.timestamp.value
+        ? data.timestamp.value
+        : data.timestamp || null,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
