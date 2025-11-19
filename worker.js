@@ -80,7 +80,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
         location,
         demographicsStatus,
         paidAdsStatus,
-        status
+        status,
+        createdAt
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -100,9 +101,10 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const job = jobRows[0];
   const paidAdsStatus = job.paidAdsStatus || null;
   const location = job.location || locationFromMessage || null;
+  const jobTimestamp = job.createdAt || null; // used for jobs_demographics.timestamp
 
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}`
+    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt=${jobTimestamp}`
   );
 
   if (!location) {
@@ -116,30 +118,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   }
 
   // ---- Step 2: Mark main job demographicsStatus = pending ----
-  console.log('➡️ [DEMOS] Step 2: Mark main job status = pending');
-
-  try {
-    const [updateJob] = await bigquery.createQueryJob({
-      query: `
-        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-        SET demographicsStatus = 'pending'
-        WHERE jobId = @jobId
-      `,
-      params: { jobId },
-    });
-    const [updateResult] = await updateJob.getQueryResults();
-    console.log(
-      `ℹ️ [DEMOS] Step 2: Updated main job demographicsStatus to 'pending' for job ${jobId} (dmlStats= ${
-        updateResult && updateResult[0] ? JSON.stringify(updateResult[0]) : 'null'
-      }).`
-    );
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error updating main job to pending for job ${jobId}:`,
-      err
-    );
-    // don't hard-fail, continue to try demographics
-  }
+  console.log('➡️ [DEMOS] Step 2: Mark main job demographicsStatus = pending');
+  await markJobDemographicsStatus(jobId, 'pending');
 
   // ---- Step 3: Load demographics source row ----
   console.log(
@@ -170,10 +150,11 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       `⚠️ [DEMOS] No demographics found in ${DEMOS_DATASET_ID}.${DEMOS_SOURCE_TABLE_ID} for location "${location}". Marking as failed.`
     );
 
-    // Delete any existing row, then insert a "failed" row with nulls
+    // Insert a "failed" row with nulls into jobs_demographics
     await overwriteJobsDemographicsRow(jobId, {
       jobId,
       location,
+      households_no: null,
       population_no: null,
       median_age: null,
       median_income_households: null,
@@ -181,6 +162,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       male_percentage: null,
       female_percentage: null,
       status: 'failed',
+      timestamp: jobTimestamp,
     });
 
     await markJobDemographicsStatus(jobId, 'failed');
@@ -202,6 +184,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const parsed = {
     population_no: toNumberOrNull(demo.population_no),
     median_age: toNumberOrNull(demo.median_age),
+    households_no: toNumberOrNull(demo.households_no),
     median_income_households: toNumberOrNull(demo.median_income_households),
     median_income_families: toNumberOrNull(demo.median_income_families),
     male_percentage: toNumberOrNull(demo.male_percentage),
@@ -211,6 +194,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const metricsArray = [
     parsed.population_no,
     parsed.median_age,
+    parsed.households_no,
     parsed.median_income_households,
     parsed.median_income_families,
     parsed.male_percentage,
@@ -231,7 +215,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     `=> newDemoStatus="${newDemoStatus}"`
   );
 
-  // Delete any existing row for this jobId (safe DML – doesn't touch streaming rows)
+  // Delete any existing row for this jobId (safe DML – affects only committed rows)
   try {
     const [deleteJob] = await bigquery.createQueryJob({
       query: `
@@ -252,11 +236,12 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     // continue anyway; insert will just create a fresh row
   }
 
-  // Streaming insert full row with metrics + status
+  // Streaming insert full row with metrics + status + timestamp
   const nowIso = new Date().toISOString();
   const rowToInsert = {
     jobId,
     location,
+    households_no: parsed.households_no,
     population_no: parsed.population_no,
     median_age: parsed.median_age,
     median_income_households: parsed.median_income_households,
@@ -264,6 +249,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     male_percentage: parsed.male_percentage,
     female_percentage: parsed.female_percentage,
     status: newDemoStatus,
+    timestamp: jobTimestamp || null, // must match job date from main table
     createdAt: nowIso,
     updatedAt: nowIso,
   };
@@ -293,20 +279,22 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     return;
   }
 
-  // Optional: one quick verification attempt (SELECT reads streaming buffer)
+  // Quick verification: should see the just-inserted row (including households_no, timestamp, etc.)
   try {
     const [checkRows] = await bigquery.query({
       query: `
         SELECT
           jobId,
           location,
+          households_no,
           population_no,
           median_age,
           median_income_households,
           median_income_families,
           male_percentage,
           female_percentage,
-          status
+          status,
+          timestamp
         FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
         WHERE jobId = @jobId
         LIMIT 1
@@ -330,36 +318,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
 
   await markJobDemographicsStatus(jobId, newDemoStatus);
 
-  // ---- Step 6: Optionally update main job.status if all segments done ----
-  console.log(
-    '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
-  );
-
-  try {
-    if (newDemoStatus === 'completed' && paidAdsStatus === 'completed') {
-      const [statusJob] = await bigquery.createQueryJob({
-        query: `
-          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-          SET status = 'completed'
-          WHERE jobId = @jobId
-        `,
-        params: { jobId },
-      });
-      await statusJob.getQueryResults();
-      console.log(
-        `ℹ️ [DEMOS] Step 6: Marked main job status='completed' for job ${jobId} (both demographics + paidAds completed).`
-      );
-    } else {
-      console.log(
-        `ℹ️ [DEMOS] Step 6: Main job status NOT set to completed for job ${jobId} (demoStatus=${newDemoStatus}, paidAdsStatus=${paidAdsStatus}).`
-      );
-    }
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error updating main job status for job ${jobId}:`,
-      err
-    );
-  }
+  // No separate Step 6 needed: markJobDemographicsStatus now also recomputes main status
 }
 
 // ---------- HELPERS ----------
@@ -371,9 +330,20 @@ function toNumberOrNull(value) {
   return n;
 }
 
+/**
+ * Updates demographicsStatus for a job and then recomputes the main `status`
+ * for that job based on ALL known section statuses (demographics, paidAds, etc.).
+ *
+ * Rules:
+ * - If ANY sub-status = 'failed'           => main status = 'failed'
+ * - Else if ANY sub-status in ('pending','queued') => main status = 'pending'
+ * - Else if ANY sub-status = 'partial'     => main status = 'partial'
+ * - Else if ALL sub-statuses = 'completed' => main status = 'completed'
+ * - Fallback                               => 'pending'
+ */
 async function markJobDemographicsStatus(jobId, demoStatus) {
-  // demoStatus is expected: 'pending' | 'completed' | 'partial' | 'failed'
   try {
+    // 1) Update demographicsStatus itself
     const [job] = await bigquery.createQueryJob({
       query: `
         UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
@@ -391,15 +361,84 @@ async function markJobDemographicsStatus(jobId, demoStatus) {
       `❌ [DEMOS] Error marking demographicsStatus='${demoStatus}' for job ${jobId}:`,
       err
     );
+    // still try to recompute main status with whatever is currently stored
+  }
+
+  // 2) Recompute main status based on all sub-statuses
+  try {
+    const [rows] = await bigquery.query({
+      query: `
+        SELECT
+          demographicsStatus,
+          paidAdsStatus
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        WHERE jobId = @jobId
+        LIMIT 1
+      `,
+      params: { jobId },
+    });
+
+    if (!rows.length) {
+      console.warn(
+        `⚠️ [DEMOS] markJobDemographicsStatus: job ${jobId} not found when recomputing main status.`
+      );
+      return;
+    }
+
+    const row = rows[0];
+    const statuses = [
+      row.demographicsStatus,
+      row.paidAdsStatus,
+    ].filter(Boolean);
+
+    let mainStatus = 'pending';
+
+    if (statuses.some((s) => s === 'failed')) {
+      mainStatus = 'failed';
+    } else if (statuses.some((s) => s === 'pending' || s === 'queued')) {
+      mainStatus = 'pending';
+    } else if (statuses.some((s) => s === 'partial')) {
+      mainStatus = 'partial';
+    } else if (statuses.length && statuses.every((s) => s === 'completed')) {
+      mainStatus = 'completed';
+    } else {
+      mainStatus = 'pending';
+    }
+
+    const [updateMain] = await bigquery.createQueryJob({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET status = @mainStatus
+        WHERE jobId = @jobId
+      `,
+      params: { jobId, mainStatus },
+    });
+    await updateMain.getQueryResults();
+
+    console.log(
+      `ℹ️ [DEMOS] Recomputed main status for job ${jobId}: ${mainStatus} (from sub-statuses=${JSON.stringify(
+        statuses
+      )})`
+    );
+  } catch (err) {
+    console.error(
+      `❌ [DEMOS] Error recomputing main status for job ${jobId}:`,
+      err
+    );
   }
 }
 
+/**
+ * Used in the "no data" path to ensure there is a row in jobs_demographics
+ * even when we have no metrics. It deletes existing row(s) and then streams a new one.
+ */
 async function overwriteJobsDemographicsRow(jobId, data) {
-  // Convenience for "no data" case
   const nowIso = new Date().toISOString();
+
   const row = {
     jobId: data.jobId,
     location: data.location || null,
+    households_no: data.households_no ?? null,
     population_no: data.population_no ?? null,
     median_age: data.median_age ?? null,
     median_income_households: data.median_income_households ?? null,
@@ -407,6 +446,7 @@ async function overwriteJobsDemographicsRow(jobId, data) {
     male_percentage: data.male_percentage ?? null,
     female_percentage: data.female_percentage ?? null,
     status: data.status || 'failed',
+    timestamp: data.timestamp || null,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
