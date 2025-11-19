@@ -46,7 +46,6 @@ function computeDemoStatusFromMetrics(metrics) {
   const values = [
     metrics.population_no,
     metrics.median_age,
-    metrics.households_no,
     metrics.median_income_households,
     metrics.median_income_families,
     metrics.male_percentage,
@@ -217,7 +216,6 @@ async function processJobDemographics(jobId) {
           jobId,
           population_no,
           median_age,
-          households_no,
           median_income_households,
           median_income_families,
           male_percentage,
@@ -241,7 +239,6 @@ async function processJobDemographics(jobId) {
       const metrics = {
         population_no: existing.population_no ?? null,
         median_age: existing.median_age ?? null,
-        households_no: existing.households_no ?? null,
         median_income_households: existing.median_income_households ?? null,
         median_income_families: existing.median_income_families ?? null,
         male_percentage: existing.male_percentage ?? null,
@@ -319,7 +316,7 @@ async function processJobDemographics(jobId) {
 
     await recomputeMainStatus(jobId);
 
-    // ---- Step 3: Load demographics source row ----
+    // ---- Step 3: Load demographics source row (no households_no) ----
     console.log(
       '➡️ [DEMOS] Step 3: Load demographics from Client_audits_data.1_demographics'
     );
@@ -329,7 +326,6 @@ async function processJobDemographics(jobId) {
         SELECT
           population_no,
           median_age,
-          households_no,
           median_income_households,
           median_income_families,
           male_percentage,
@@ -377,7 +373,6 @@ async function processJobDemographics(jobId) {
     const metrics = {
       population_no: safeNumber(demo.population_no),
       median_age: safeNumber(demo.median_age),
-      households_no: safeNumber(demo.households_no),
       median_income_households: safeNumber(demo.median_income_households),
       median_income_families: safeNumber(demo.median_income_families),
       male_percentage: safeNumber(demo.male_percentage),
@@ -410,7 +405,6 @@ async function processJobDemographics(jobId) {
     const rowToInsert = {
       jobId,
       location,
-      households_no: metrics.households_no,
       population_no: metrics.population_no,
       median_age: metrics.median_age,
       median_income_households: metrics.median_income_households,
@@ -459,13 +453,12 @@ async function processJobDemographics(jobId) {
       return;
     }
 
-    // Verification read-back
+    // Verification read-back (no households_no)
     const [verifyRows] = await bigquery.query({
       query: `
         SELECT
           jobId,
           location,
-          households_no,
           population_no,
           median_age,
           median_income_households,
