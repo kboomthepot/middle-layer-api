@@ -20,8 +20,6 @@ const JOBS_DEMOS_TABLE_ID = 'jobs_demographics';
 const bigquery = new BigQuery({ projectId: PROJECT_ID });
 
 const app = express();
-
-// Pub/Sub sends base64-encoded JSON in { message: { data: "..." } }
 app.use(bodyParser.json());
 
 // Simple health check
@@ -35,7 +33,7 @@ app.post('/', async (req, res) => {
     const envelope = req.body;
     if (!envelope || !envelope.message || !envelope.message.data) {
       console.error('❌ Invalid Pub/Sub message format:', JSON.stringify(envelope));
-      // Always 204 so Pub/Sub doesn’t retry forever
+      // ACK anyway so Pub/Sub doesn’t retry forever
       return res.status(204).send();
     }
 
@@ -58,11 +56,11 @@ app.post('/', async (req, res) => {
 
     await processJobDemographics(jobId);
 
-    // Always ACK so Pub/Sub does not retry
+    // Always ACK so Pub/Sub does not retry this message
     res.status(204).send();
   } catch (err) {
     console.error('❌ Error handling Pub/Sub message:', err);
-    // Still ACK to avoid infinite retry loops
+    // ACK even on error to avoid infinite retry loop
     res.status(204).send();
   }
 });
@@ -81,7 +79,8 @@ async function processJobDemographics(jobId) {
         jobId,
         location,
         demographicsStatus,
-        paidAdsStatus
+        paidAdsStatus,
+        status
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -142,7 +141,7 @@ async function processJobDemographics(jobId) {
       location,
       population_no: null,
       median_age: null,
-      // households_no: null,          // ❌ REMOVE: column does not exist in table
+      // households_no: null, // <- not in jobs_demographics schema (yet)
       median_income_households: null,
       median_income_families: null,
       male_percentage: null,
@@ -155,8 +154,7 @@ async function processJobDemographics(jobId) {
         .dataset(DATASET_ID)
         .table(JOBS_DEMOS_TABLE_ID)
         .insert([pendingRow], {
-          // Safety: ignore any extra fields that might not exist in schema
-          ignoreUnknownValues: true,
+          ignoreUnknownValues: true, // safety
         });
 
       console.log(
@@ -167,15 +165,137 @@ async function processJobDemographics(jobId) {
         `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics:`,
         JSON.stringify(err.errors || err, null, 2)
       );
-      // Don’t throw; we don’t want Pub/Sub retries
-      return;
+      return; // don't continue if we can't create the row
     }
   }
 
-  // ---- Step 3: (NEXT) Fetch actual demographics from Client_audits_data.1_demographics ----
-  // We’ll implement this after we confirm rows are being created in jobs_demographics.
+  // ---- Step 3: Load demographics source row from Client_audits_data.1_demographics ----
   console.log(
-    `ℹ️ [DEMOS] Step 2 finished for job ${jobId}. Next step is to wire reading from Client_audits_data.1_demographics.`
+    '➡️ [DEMOS] Step 3: Load demographics from Client_audits_data.1_demographics'
+  );
+
+  const [demoRows] = await bigquery.query({
+    query: `
+      SELECT
+        population_no,
+        median_age,
+        households_no,
+        median_income_households,
+        median_income_families,
+        male_percentage,
+        female_percentage
+      FROM \`${PROJECT_ID}.${DEMOS_DATASET_ID}.${DEMOS_SOURCE_TABLE_ID}\`
+      WHERE location = @location
+      LIMIT 1
+    `,
+    params: { location },
+  });
+
+  console.log(`ℹ️ [DEMOS] Step 3 result rows (demographics): ${demoRows.length}`);
+
+  if (!demoRows.length) {
+    console.warn(
+      `⚠️ [DEMOS] No demographics found in ${DEMOS_DATASET_ID}.${DEMOS_SOURCE_TABLE_ID} for location "${location}". Marking as no_data.`
+    );
+
+    // Mark jobs_demographics + job as no_data
+    await bigquery.query({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+        SET status = 'no_data'
+        WHERE jobId = @jobId
+      `,
+      params: { jobId },
+    });
+
+    await bigquery.query({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET demographicsStatus = 'no_data'
+        WHERE jobId = @jobId
+      `,
+      params: { jobId },
+    });
+
+    return;
+  }
+
+  const demo = demoRows[0];
+
+  console.log(
+    `ℹ️ [DEMOS] Found demographics for "${location}": ` +
+      JSON.stringify(demo)
+  );
+
+  // ---- Step 4: Update jobs_demographics row with actual values ----
+  console.log(
+    '➡️ [DEMOS] Step 4: Update jobs_demographics with demographics values'
+  );
+
+  await bigquery.query({
+    query: `
+      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+      SET
+        population_no = @population_no,
+        median_age = @median_age,
+        median_income_households = @median_income_households,
+        median_income_families = @median_income_families,
+        male_percentage = @male_percentage,
+        female_percentage = @female_percentage,
+        status = 'completed'
+      WHERE jobId = @jobId
+    `,
+    params: {
+      jobId,
+      population_no: demo.population_no ?? null,
+      median_age: demo.median_age ?? null,
+      median_income_households: demo.median_income_households ?? null,
+      median_income_families: demo.median_income_families ?? null,
+      male_percentage: demo.male_percentage ?? null,
+      female_percentage: demo.female_percentage ?? null,
+    },
+  });
+
+  console.log(
+    `✅ [DEMOS] Updated jobs_demographics row for job ${jobId} with demographics data`
+  );
+
+  // ---- Step 5: Update job's demographicsStatus in main table ----
+  console.log(
+    '➡️ [DEMOS] Step 5: Update client_audits_jobs.demographicsStatus'
+  );
+
+  await bigquery.query({
+    query: `
+      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      SET demographicsStatus = 'completed'
+      WHERE jobId = @jobId
+    `,
+    params: { jobId },
+  });
+
+  console.log(
+    `✅ [DEMOS] Marked demographicsStatus = completed for job ${jobId}`
+  );
+
+  // ---- Step 6: Optionally update main status if all segments done ----
+  console.log(
+    '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
+  );
+
+  await bigquery.query({
+    query: `
+      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      SET status = 'completed'
+      WHERE jobId = @jobId
+        AND demographicsStatus = 'completed'
+        AND paidAdsStatus = 'completed'
+    `,
+    params: { jobId },
+  });
+
+  console.log(
+    `ℹ️ [DEMOS] Step 6 checked for full completion for job ${jobId}.`
   );
 }
 
