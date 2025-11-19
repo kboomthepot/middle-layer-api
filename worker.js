@@ -1,3 +1,24 @@
+// worker.js
+
+const express = require('express');
+const bodyParser = require('body-parser');
+const { BigQuery } = require('@google-cloud/bigquery');
+
+const app = express();
+app.use(bodyParser.json());
+
+// ---- GCP / BigQuery setup ----
+const PROJECT_ID = 'ghs-construction-1734441714520';
+const bigquery = new BigQuery({ projectId: PROJECT_ID });
+
+const JOBS_TABLE = `${PROJECT_ID}.Client_audits.client_audits_jobs`;
+const JOBS_DEMOS_TABLE = `${PROJECT_ID}.Client_audits.jobs_demographics`;
+const DEMOS_SOURCE_TABLE = `${PROJECT_ID}.Client_audits_data.1_demographics`;
+
+// ============================================================================
+//  MAIN DEMOGRAPHICS WORKER FUNCTION (your existing logic)
+// ============================================================================
+
 async function processJobDemographics(jobId, locationFromMessage) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
@@ -74,7 +95,8 @@ async function processJobDemographics(jobId, locationFromMessage) {
         `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics:`,
         JSON.stringify(err.errors || err, null, 2)
       );
-      throw err;
+      // Don't crash container, just stop this run
+      return;
     }
   } else {
     console.log(
@@ -217,6 +239,63 @@ async function processJobDemographics(jobId, locationFromMessage) {
       `❌ [DEMOS] Error updating jobs_demographics for job ${jobId}:`,
       JSON.stringify(err.errors || err, null, 2)
     );
+    // Let Pub/Sub retry if needed, but don't crash the whole container here
     throw err;
   }
 }
+
+// ============================================================================
+//  PUB/SUB PUSH ENDPOINT
+// ============================================================================
+
+// Simple health endpoint for Cloud Run
+app.get('/', (req, res) => {
+  res.send('client-audits-worker is running');
+});
+
+// Pub/Sub push handler
+app.post('/pubsub/push', async (req, res) => {
+  try {
+    const message = req.body.message;
+
+    if (!message || !message.data) {
+      console.warn('⚠️ [PUBSUB] No message.data in request body:', JSON.stringify(req.body));
+      return res.status(400).send('No message data');
+    }
+
+    const decoded = Buffer.from(message.data, 'base64').toString('utf8');
+    console.log('📨 [PUBSUB] Decoded message data:', decoded);
+
+    let payload;
+    try {
+      payload = JSON.parse(decoded);
+    } catch (e) {
+      console.error('❌ [PUBSUB] Failed to parse JSON from message data:', e);
+      return res.status(400).send('Invalid JSON');
+    }
+
+    const { jobId, location } = payload;
+    if (!jobId) {
+      console.error('❌ [PUBSUB] jobId missing from payload:', payload);
+      return res.status(400).send('jobId is required');
+    }
+
+    await processJobDemographics(jobId, location || null);
+
+    // Pub/Sub expects 204 on success
+    res.status(204).send();
+  } catch (err) {
+    console.error('❌ [PUBSUB] Error in /pubsub/push handler:', err);
+    // 500 → Pub/Sub will retry according to subscription settings
+    res.status(500).send('Internal error');
+  }
+});
+
+// ============================================================================
+//  START SERVER (this is what Cloud Run cares about)
+// ============================================================================
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => {
+  console.log(`🚀 client-audits-worker listening on port ${PORT}`);
+});
