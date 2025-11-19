@@ -30,6 +30,10 @@ function toNumberOrNull(value) {
   return Number.isNaN(n) ? null : n;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // ---------- HEALTH CHECK ----------
 app.get('/', (req, res) => {
   res.send('Worker service listening on port 8080');
@@ -199,6 +203,73 @@ async function processJobDemographics(jobId, locationFromMessage) {
       );
       return; // don't continue if we can't create the row
     }
+  }
+
+  // Step 2b: verify that the pending row actually exists (up to 3 attempts)
+  let foundAfterInsert = false;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    await sleep(300 * attempt); // small backoff: 300ms, 600ms, 900ms
+
+    const [verifyRows] = await bigquery.query({
+      query: `
+        SELECT jobId, status
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+        WHERE jobId = @jobId
+        LIMIT 1
+      `,
+      params: { jobId }
+    });
+
+    if (verifyRows.length > 0) {
+      console.log(
+        `ℹ️ [DEMOS] Verification attempt ${attempt}: jobs_demographics row FOUND for job ${jobId} with status=${verifyRows[0].status}`
+      );
+      foundAfterInsert = true;
+      break;
+    } else {
+      console.warn(
+        `⚠️ [DEMOS] Verification attempt ${attempt}: no jobs_demographics row found yet for job ${jobId}`
+      );
+    }
+  }
+
+  if (!foundAfterInsert) {
+    console.error(
+      `❌ [DEMOS] After 3 verification attempts, no jobs_demographics row exists for job ${jobId}. Marking as failed.`
+    );
+
+    // Try to mark statuses as failed
+    try {
+      // In case a phantom row exists, mark it failed
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+          SET status = 'failed_insert'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId }
+      });
+
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+          SET demographicsStatus = 'failed'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId }
+      });
+
+      console.log(
+        `ℹ️ [DEMOS] Marked job ${jobId} as failed (failed_insert / demographicsStatus=failed).`
+      );
+    } catch (markErr) {
+      console.error(
+        `⚠️ [DEMOS] Failed to update failure statuses for job ${jobId}:`,
+        JSON.stringify(markErr.errors || markErr, null, 2)
+      );
+    }
+
+    return; // stop processing this job
   }
 
   // At the end of Step 2, mark main job's overall status = 'pending'
@@ -381,10 +452,38 @@ async function processJobDemographics(jobId, locationFromMessage) {
       params: { jobId }
     });
 
+    const checkRow = checkRows[0] || null;
+
     console.log(
       `ℹ️ [DEMOS] Step 4 check row for job ${jobId}:`,
-      JSON.stringify(checkRows[0] || null, null, 2)
+      JSON.stringify(checkRow, null, 2)
     );
+
+    if (!checkRow) {
+      console.error(
+        `❌ [DEMOS] Step 4: After UPDATE, no jobs_demographics row found for job ${jobId}. Marking as error_update.`
+      );
+
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+          SET status = 'error_update'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId }
+      });
+
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+          SET demographicsStatus = 'error'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId }
+      });
+
+      return;
+    }
   } catch (err) {
     console.error(
       `❌ [DEMOS] Error in Step 4 updating jobs_demographics for job ${jobId}:`,
