@@ -31,6 +31,18 @@ function toIsoStringOrNull(val) {
   return null;
 }
 
+// Safely convert raw values (like "250,000+" or "70,992") to numbers or null
+function safeNumber(raw) {
+  if (raw === null || raw === undefined) return null;
+  const s = String(raw).trim();
+  if (s === '') return null;
+  // Strip commas and plus signs like "250,000+"
+  const cleaned = s.replace(/,/g, '').replace(/\+/g, '');
+  const n = Number(cleaned);
+  if (Number.isNaN(n)) return null;
+  return n;
+}
+
 function computeDemoStatusFromMetrics(metrics) {
   const values = [
     metrics.population_no,
@@ -328,19 +340,13 @@ async function processJobDemographics(jobId) {
     );
 
     const metrics = {
-      population_no: demo.population_no != null && demo.population_no !== '' ? Number(demo.population_no) : null,
-      median_age: demo.median_age != null && demo.median_age !== '' ? Number(demo.median_age) : null,
-      households_no: demo.households_no != null && demo.households_no !== '' ? Number(demo.households_no) : null,
-      median_income_households:
-        demo.median_income_households != null && demo.median_income_households !== ''
-          ? Number(demo.median_income_households)
-          : null,
-      median_income_families:
-        demo.median_income_families != null && demo.median_income_families !== ''
-          ? Number(demo.median_income_families)
-          : null,
-      male_percentage: demo.male_percentage != null && demo.male_percentage !== '' ? Number(demo.male_percentage) : null,
-      female_percentage: demo.female_percentage != null && demo.female_percentage !== '' ? Number(demo.female_percentage) : null,
+      population_no: safeNumber(demo.population_no),
+      median_age: safeNumber(demo.median_age),
+      households_no: safeNumber(demo.households_no),
+      median_income_households: safeNumber(demo.median_income_households),
+      median_income_families: safeNumber(demo.median_income_families),
+      male_percentage: safeNumber(demo.male_percentage),
+      female_percentage: safeNumber(demo.female_percentage),
     };
 
     const newDemoStatus = computeDemoStatusFromMetrics(metrics);
@@ -387,14 +393,37 @@ async function processJobDemographics(jobId) {
       JSON.stringify(rowToInsert)
     );
 
-    await bigquery
-      .dataset(DATASET_ID)
-      .table(JOBS_DEMOS_TABLE_ID)
-      .insert([rowToInsert]);
+    // ----- STREAMING INSERT with explicit error logging -----
+    try {
+      await bigquery
+        .dataset(DATASET_ID)
+        .table(JOBS_DEMOS_TABLE_ID)
+        .insert([rowToInsert], {
+          ignoreUnknownValues: true,   // don't die if schema has fewer columns
+        });
 
-    console.log(
-      `✅ [DEMOS] Streaming insert completed for job ${jobId} into ${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}`
-    );
+      console.log(
+        `✅ [DEMOS] Streaming insert completed for job ${jobId} into ${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}`
+      );
+    } catch (insertErr) {
+      console.error(
+        `❌ [DEMOS] Streaming insert error for job ${jobId}:`,
+        JSON.stringify(insertErr.errors || insertErr, null, 2)
+      );
+
+      // Mark as failed and recompute main status, then bail out
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+          SET demographicsStatus = 'failed'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId },
+      });
+
+      await recomputeMainStatus(jobId);
+      return;
+    }
 
     // Verification read-back
     const [verifyRows] = await bigquery.query({
