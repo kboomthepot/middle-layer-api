@@ -206,85 +206,100 @@ async function processJobDemographics(jobId) {
       return;
     }
 
-    // ---- Strong idempotency guard ----
-    if (currentDemoStatus === 'completed' || currentDemoStatus === 'partial') {
+    // ---- GLOBAL IDEMPOTENCY GUARD (runs for ANY status) ----
+    console.log(
+      `ℹ️ [DEMOS] Idempotency check: looking for existing jobs_demographics row for job ${jobId}`
+    );
+
+    const [demoCheckRows] = await bigquery.query({
+      query: `
+        SELECT
+          jobId,
+          population_no,
+          median_age,
+          households_no,
+          median_income_households,
+          median_income_families,
+          male_percentage,
+          female_percentage,
+          status,
+          timestamp
+        FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+        WHERE jobId = @jobId
+        LIMIT 1
+      `,
+      params: { jobId },
+    });
+
+    const existing = demoCheckRows[0] || null;
+    console.log(
+      `ℹ️ [DEMOS] Idempotency existing row for job ${jobId}: ` +
+      JSON.stringify(existing)
+    );
+
+    if (existing) {
+      const metrics = {
+        population_no: existing.population_no ?? null,
+        median_age: existing.median_age ?? null,
+        households_no: existing.households_no ?? null,
+        median_income_households: existing.median_income_households ?? null,
+        median_income_families: existing.median_income_families ?? null,
+        male_percentage: existing.male_percentage ?? null,
+        female_percentage: existing.female_percentage ?? null,
+      };
+
+      const hasAnyMetric =
+        Object.values(metrics).filter(v => v !== null && v !== undefined).length > 0;
+      const derivedStatus = computeDemoStatusFromMetrics(metrics);
+      const existingStatus = existing.status || derivedStatus;
+
       console.log(
-        `ℹ️ [DEMOS] Idempotency: Job ${jobId} already ${currentDemoStatus}. Checking jobs_demographics row.`
+        `ℹ️ [DEMOS] Idempotency metrics for job ${jobId}: hasAnyMetric=${hasAnyMetric}, ` +
+        `derived=${derivedStatus}, existing.status=${existing.status}, ` +
+        `currentDemoStatus=${currentDemoStatus}`
       );
 
-      const [demoCheckRows] = await bigquery.query({
-        query: `
-          SELECT
-            jobId,
-            population_no,
-            median_age,
-            households_no,
-            median_income_households,
-            median_income_families,
-            male_percentage,
-            female_percentage,
-            status,
-            timestamp
-          FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-          WHERE jobId = @jobId
-          LIMIT 1
-        `,
-        params: { jobId },
-      });
+      // If we already have metrics and the row is effectively completed/partial,
+      // then align the main job status and SKIP further processing.
+      if (
+        hasAnyMetric &&
+        (existingStatus === 'completed' || existingStatus === 'partial')
+      ) {
+        const finalDemoStatus = existingStatus;
 
-      const existing = demoCheckRows[0] || null;
-      console.log(
-        `ℹ️ [DEMOS] Idempotency check existing row for job ${jobId}: ` +
-        JSON.stringify(existing)
-      );
-
-      if (existing) {
-        const metrics = {
-          population_no: existing.population_no ?? null,
-          median_age: existing.median_age ?? null,
-          households_no: existing.households_no ?? null,
-          median_income_households: existing.median_income_households ?? null,
-          median_income_families: existing.median_income_families ?? null,
-          male_percentage: existing.male_percentage ?? null,
-          female_percentage: existing.female_percentage ?? null,
-        };
-        const derived = computeDemoStatusFromMetrics(metrics);
-        const hasAnyMetric =
-          Object.values(metrics).filter(v => v !== null && v !== undefined).length > 0;
-
-        console.log(
-          `ℹ️ [DEMOS] Idempotency metrics for job ${jobId}: hasAnyMetric=${hasAnyMetric}, ` +
-          `derived=${derived}, existing.status=${existing.status}`
-        );
-
-        if (hasAnyMetric) {
-          // Ensure statuses are aligned & bail
-          const finalStatus =
-            existing.status === 'completed' || existing.status === 'partial'
-              ? existing.status
-              : derived;
-
+        if (currentDemoStatus !== finalDemoStatus) {
           await bigquery.query({
             query: `
               UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
               SET demographicsStatus = @demoStatus
               WHERE jobId = @jobId
             `,
-            params: { jobId, demoStatus: finalStatus },
+            params: { jobId, demoStatus: finalDemoStatus },
           });
 
           console.log(
-            `ℹ️ [DEMOS] Idempotency: job ${jobId} already populated, set demographicsStatus="${finalStatus}" and skipping.`
+            `ℹ️ [DEMOS] Idempotency: aligned demographicsStatus="${finalDemoStatus}" ` +
+            `for job ${jobId} (was "${currentDemoStatus}")`
           );
-
-          await recomputeMainStatus(jobId);
-          return;
+        } else {
+          console.log(
+            `ℹ️ [DEMOS] Idempotency: demographicsStatus already "${currentDemoStatus}" ` +
+            `for job ${jobId}, nothing to update.`
+          );
         }
+
+        await recomputeMainStatus(jobId);
+
+        console.log(
+          `ℹ️ [DEMOS] Idempotency: job ${jobId} already has populated demographics, ` +
+          `skipping re-processing.`
+        );
+        return;
       }
 
       console.log(
-        `ℹ️ [DEMOS] Idempotency: demographicsStatus=${currentDemoStatus} but ` +
-        `jobs_demographics missing or empty metrics. Proceeding with re-processing.`
+        `ℹ️ [DEMOS] Idempotency: existing row is missing metrics or not completed/partial. ` +
+        `Proceeding with re-processing for job ${jobId}.`
       );
     }
 
@@ -491,13 +506,15 @@ async function processJobDemographics(jobId) {
   } catch (err) {
     console.error(`❌ [DEMOS] Error in processJobDemographics for job ${jobId}:`, err);
 
-    // Best-effort mark as failed
+    // Best-effort mark as failed (only if not already completed/partial)
     try {
       await bigquery.query({
         query: `
           UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
           SET demographicsStatus = 'failed'
           WHERE jobId = @jobId
+            AND demographicsStatus != 'completed'
+            AND demographicsStatus != 'partial'
         `,
         params: { jobId },
       });
