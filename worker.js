@@ -31,12 +31,11 @@ function toIsoStringOrNull(val) {
   return null;
 }
 
-// Safely convert raw values (like "250,000+" or "70,992") to numbers or null
+// Safely convert values like "250,000+" to numbers or null
 function safeNumber(raw) {
   if (raw === null || raw === undefined) return null;
   const s = String(raw).trim();
   if (s === '') return null;
-  // Strip commas and plus signs like "250,000+"
   const cleaned = s.replace(/,/g, '').replace(/\+/g, '');
   const n = Number(cleaned);
   if (Number.isNaN(n)) return null;
@@ -89,7 +88,7 @@ async function recomputeMainStatus(jobId) {
       newStatus = 'failed';
     } else if (subStatuses.length > 0 && subStatuses.every(s => s === 'completed')) {
       newStatus = 'completed';
-    } else if (subStatuses.some(s => s === 'queued' || s === 'pending')) {
+    } else if (subStatuses.some(s => s === 'queued' || s === 'pending' || s === 'partial')) {
       newStatus = 'pending';
     } else {
       newStatus = 'pending';
@@ -207,11 +206,10 @@ async function processJobDemographics(jobId) {
       return;
     }
 
-    // ---- Idempotency guard ----
-    if (currentDemoStatus === 'completed' || currentDemoStatus === 'failed') {
+    // ---- Strong idempotency guard ----
+    if (currentDemoStatus === 'completed' || currentDemoStatus === 'partial') {
       console.log(
-        `ℹ️ [DEMOS] Job ${jobId} already has demographicsStatus="${currentDemoStatus}". ` +
-        `Checking jobs_demographics for populated row to decide whether to skip.`
+        `ℹ️ [DEMOS] Idempotency: Job ${jobId} already ${currentDemoStatus}. Checking jobs_demographics row.`
       );
 
       const [demoCheckRows] = await bigquery.query({
@@ -225,7 +223,8 @@ async function processJobDemographics(jobId) {
             median_income_families,
             male_percentage,
             female_percentage,
-            status
+            status,
+            timestamp
           FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
           WHERE jobId = @jobId
           LIMIT 1
@@ -233,38 +232,59 @@ async function processJobDemographics(jobId) {
         params: { jobId },
       });
 
-      if (demoCheckRows.length) {
-        const r = demoCheckRows[0];
+      const existing = demoCheckRows[0] || null;
+      console.log(
+        `ℹ️ [DEMOS] Idempotency check existing row for job ${jobId}: ` +
+        JSON.stringify(existing)
+      );
+
+      if (existing) {
         const metrics = {
-          population_no: r.population_no ?? null,
-          median_age: r.median_age ?? null,
-          households_no: r.households_no ?? null,
-          median_income_households: r.median_income_households ?? null,
-          median_income_families: r.median_income_families ?? null,
-          male_percentage: r.male_percentage ?? null,
-          female_percentage: r.female_percentage ?? null,
+          population_no: existing.population_no ?? null,
+          median_age: existing.median_age ?? null,
+          households_no: existing.households_no ?? null,
+          median_income_households: existing.median_income_households ?? null,
+          median_income_families: existing.median_income_families ?? null,
+          male_percentage: existing.male_percentage ?? null,
+          female_percentage: existing.female_percentage ?? null,
         };
         const derived = computeDemoStatusFromMetrics(metrics);
         const hasAnyMetric =
           Object.values(metrics).filter(v => v !== null && v !== undefined).length > 0;
 
         console.log(
-          `ℹ️ [DEMOS] Idempotency check for job ${jobId}: ` +
-          `existing jobs_demographics.status=${r.status}, derivedFromMetrics=${derived}`
+          `ℹ️ [DEMOS] Idempotency metrics for job ${jobId}: hasAnyMetric=${hasAnyMetric}, ` +
+          `derived=${derived}, existing.status=${existing.status}`
         );
 
-        if (hasAnyMetric && (r.status === 'completed' || r.status === 'partial' || derived === 'completed')) {
+        if (hasAnyMetric) {
+          // Ensure statuses are aligned & bail
+          const finalStatus =
+            existing.status === 'completed' || existing.status === 'partial'
+              ? existing.status
+              : derived;
+
+          await bigquery.query({
+            query: `
+              UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+              SET demographicsStatus = @demoStatus
+              WHERE jobId = @jobId
+            `,
+            params: { jobId, demoStatus: finalStatus },
+          });
+
           console.log(
-            `ℹ️ [DEMOS] Job ${jobId} already has populated demographics row; skipping re-processing.`
+            `ℹ️ [DEMOS] Idempotency: job ${jobId} already populated, set demographicsStatus="${finalStatus}" and skipping.`
           );
+
           await recomputeMainStatus(jobId);
           return;
         }
       }
 
       console.log(
-        `ℹ️ [DEMOS] Idempotency guard: demographicsStatus=${currentDemoStatus} but ` +
-        `jobs_demographics missing or empty. Proceeding with re-processing.`
+        `ℹ️ [DEMOS] Idempotency: demographicsStatus=${currentDemoStatus} but ` +
+        `jobs_demographics missing or empty metrics. Proceeding with re-processing.`
       );
     }
 
@@ -399,7 +419,7 @@ async function processJobDemographics(jobId) {
         .dataset(DATASET_ID)
         .table(JOBS_DEMOS_TABLE_ID)
         .insert([rowToInsert], {
-          ignoreUnknownValues: true,   // don't die if schema has fewer columns
+          ignoreUnknownValues: true,
         });
 
       console.log(
@@ -411,7 +431,6 @@ async function processJobDemographics(jobId) {
         JSON.stringify(insertErr.errors || insertErr, null, 2)
       );
 
-      // Mark as failed and recompute main status, then bail out
       await bigquery.query({
         query: `
           UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
