@@ -1,30 +1,7 @@
-// worker.js
-
-const express = require('express');
-const bodyParser = require('body-parser');
-const { BigQuery } = require('@google-cloud/bigquery');
-
-const app = express();
-app.use(bodyParser.json());
-
-// ---- GCP / BigQuery setup ----
-const PROJECT_ID = 'ghs-construction-1734441714520';
-const bigquery = new BigQuery({ projectId: PROJECT_ID });
-
-const JOBS_TABLE = `${PROJECT_ID}.Client_audits.client_audits_jobs`;
-const JOBS_DEMOS_TABLE = `${PROJECT_ID}.Client_audits.jobs_demographics`;
-const DEMOS_SOURCE_TABLE = `${PROJECT_ID}.Client_audits_data.1_demographics`;
-
-// ============================================================================
-//  MAIN DEMOGRAPHICS WORKER FUNCTION (your existing logic)
-// ============================================================================
-
 async function processJobDemographics(jobId, locationFromMessage) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
-  //
-  // STEP 1: Load job row from client_audits_jobs
-  //
+  // STEP 1: Load job row
   console.log('➡️ [DEMOS] Step 1: Load job row from client_audits_jobs');
   const [jobRows] = await bigquery.query({
     query: `
@@ -49,9 +26,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
     `demographicsStatus = ${jobRow.demographicsStatus}, paidAdsStatus = ${jobRow.paidAdsStatus}`
   );
 
-  //
   // STEP 2: Ensure pending row exists in jobs_demographics
-  //
   console.log('➡️ [DEMOS] Step 2: Upsert pending row into jobs_demographics');
   const [existingDemoRows] = await bigquery.query({
     query: `
@@ -95,7 +70,27 @@ async function processJobDemographics(jobId, locationFromMessage) {
         `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics:`,
         JSON.stringify(err.errors || err, null, 2)
       );
-      // Don't crash container, just stop this run
+
+      // Mark error on main job + demo table instead of throwing
+      await bigquery.query({
+        query: `
+          UPDATE \`${JOBS_DEMOS_TABLE}\`
+          SET status = 'error', updatedAt = CURRENT_TIMESTAMP()
+          WHERE jobId = @jobId
+        `,
+        params: { jobId }
+      }).catch(e => console.error('⚠️ [DEMOS] Failed to mark jobs_demographics error:', e));
+
+      await bigquery.query({
+        query: `
+          UPDATE \`${JOBS_TABLE}\`
+          SET demographicsStatus = 'error', updatedAt = CURRENT_TIMESTAMP()
+          WHERE jobId = @jobId
+        `,
+        params: { jobId }
+      }).catch(e => console.error('⚠️ [DEMOS] Failed to mark client_audits_jobs error:', e));
+
+      // Stop processing this job, but DO NOT throw → Pub/Sub won't retry forever
       return;
     }
   } else {
@@ -104,9 +99,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
     );
   }
 
-  //
-  // STEP 3: Load demographics from Client_audits_data.1_demographics
-  //
+  // STEP 3: Load demographics from source table (unchanged except for error logic)
   console.log('➡️ [DEMOS] Step 3: Load demographics from Client_audits_data.1_demographics');
 
   const [demoRows] = await bigquery.query({
@@ -141,7 +134,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
         WHERE jobId = @jobId
       `,
       params: { jobId }
-    });
+    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark jobs_demographics no_data:', e));
 
     await bigquery.query({
       query: `
@@ -150,7 +143,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
         WHERE jobId = @jobId
       `,
       params: { jobId }
-    });
+    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark client_audits_jobs no_data:', e));
 
     return;
   }
@@ -162,9 +155,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
     JSON.stringify(demo)
   );
 
-  //
-  // STEP 4: Update jobs_demographics with demographics values
-  //
+  // STEP 4: Update jobs_demographics
   console.log('➡️ [DEMOS] Step 4: Update jobs_demographics with demographics values');
 
   const updateParams = {
@@ -215,15 +206,11 @@ async function processJobDemographics(jobId, locationFromMessage) {
       params: updateParams
     });
 
-    const [updateResult] = await updateJob.getQueryResults();
-    console.log(
-      `✅ [DEMOS] Updated jobs_demographics for job ${jobId}. ` +
-      `DML result row count (usually 0 for UPDATE): ${updateResult.length}`
-    );
+    await updateJob.getQueryResults();
 
-    //
-    // STEP 5: Mark demographicsStatus = completed on main jobs table
-    //
+    console.log(`✅ [DEMOS] Updated jobs_demographics for job ${jobId}.`);
+
+    // STEP 5: Mark main job as completed
     await bigquery.createQueryJob({
       query: `
         UPDATE \`${JOBS_TABLE}\`
@@ -239,63 +226,27 @@ async function processJobDemographics(jobId, locationFromMessage) {
       `❌ [DEMOS] Error updating jobs_demographics for job ${jobId}:`,
       JSON.stringify(err.errors || err, null, 2)
     );
-    // Let Pub/Sub retry if needed, but don't crash the whole container here
-    throw err;
+
+    // Mark as error instead of throwing so Pub/Sub doesn't retry forever
+    await bigquery.query({
+      query: `
+        UPDATE \`${JOBS_DEMOS_TABLE}\`
+        SET status = 'error', updatedAt = CURRENT_TIMESTAMP()
+        WHERE jobId = @jobId
+      `,
+      params: { jobId }
+    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark jobs_demographics error (update step):', e));
+
+    await bigquery.query({
+      query: `
+        UPDATE \`${JOBS_TABLE}\`
+        SET demographicsStatus = 'error', updatedAt = CURRENT_TIMESTAMP()
+        WHERE jobId = @jobId
+      `,
+      params: { jobId }
+    }).catch(e => console.error('⚠️ [DEMOS] Failed to mark client_audits_jobs error (update step):', e));
+
+    // Do NOT throw here → handler can return 204
+    return;
   }
 }
-
-// ============================================================================
-//  PUB/SUB PUSH ENDPOINT
-// ============================================================================
-
-// Simple health endpoint for Cloud Run
-app.get('/', (req, res) => {
-  res.send('client-audits-worker is running');
-});
-
-// Pub/Sub push handler
-app.post('/pubsub/push', async (req, res) => {
-  try {
-    const message = req.body.message;
-
-    if (!message || !message.data) {
-      console.warn('⚠️ [PUBSUB] No message.data in request body:', JSON.stringify(req.body));
-      return res.status(400).send('No message data');
-    }
-
-    const decoded = Buffer.from(message.data, 'base64').toString('utf8');
-    console.log('📨 [PUBSUB] Decoded message data:', decoded);
-
-    let payload;
-    try {
-      payload = JSON.parse(decoded);
-    } catch (e) {
-      console.error('❌ [PUBSUB] Failed to parse JSON from message data:', e);
-      return res.status(400).send('Invalid JSON');
-    }
-
-    const { jobId, location } = payload;
-    if (!jobId) {
-      console.error('❌ [PUBSUB] jobId missing from payload:', payload);
-      return res.status(400).send('jobId is required');
-    }
-
-    await processJobDemographics(jobId, location || null);
-
-    // Pub/Sub expects 204 on success
-    res.status(204).send();
-  } catch (err) {
-    console.error('❌ [PUBSUB] Error in /pubsub/push handler:', err);
-    // 500 → Pub/Sub will retry according to subscription settings
-    res.status(500).send('Internal error');
-  }
-});
-
-// ============================================================================
-//  START SERVER (this is what Cloud Run cares about)
-// ============================================================================
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 client-audits-worker listening on port ${PORT}`);
-});
