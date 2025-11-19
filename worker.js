@@ -227,77 +227,156 @@ async function processJobDemographics(jobId) {
       JSON.stringify(demo)
   );
 
-  // ---- Step 4: Update jobs_demographics row with actual values ----
+    // ---- Step 4: Update jobs_demographics row with actual values ----
   console.log(
     '➡️ [DEMOS] Step 4: Update jobs_demographics with demographics values'
   );
 
-  await bigquery.query({
-    query: `
-      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-      SET
-        population_no = @population_no,
-        median_age = @median_age,
-        median_income_households = @median_income_households,
-        median_income_families = @median_income_families,
-        male_percentage = @male_percentage,
-        female_percentage = @female_percentage,
-        status = 'completed'
-      WHERE jobId = @jobId
-    `,
-    params: {
-      jobId,
-      population_no: demo.population_no ?? null,
-      median_age: demo.median_age ?? null,
-      median_income_households: demo.median_income_households ?? null,
-      median_income_families: demo.median_income_families ?? null,
-      male_percentage: demo.male_percentage ?? null,
-      female_percentage: demo.female_percentage ?? null,
-    },
-  });
+  // Ensure numeric fields are numbers or null
+  const updateParams = {
+    jobId,
+    population_no:
+      demo.population_no != null && demo.population_no !== ''
+        ? Number(demo.population_no)
+        : null,
+    median_age:
+      demo.median_age != null && demo.median_age !== ''
+        ? Number(demo.median_age)
+        : null,
+    median_income_households:
+      demo.median_income_households != null && demo.median_income_households !== ''
+        ? Number(demo.median_income_households)
+        : null,
+    median_income_families:
+      demo.median_income_families != null && demo.median_income_families !== ''
+        ? Number(demo.median_income_families)
+        : null,
+    male_percentage:
+      demo.male_percentage != null && demo.male_percentage !== ''
+        ? Number(demo.male_percentage)
+        : null,
+    female_percentage:
+      demo.female_percentage != null && demo.female_percentage !== ''
+        ? Number(demo.female_percentage)
+        : null,
+  };
 
-  console.log(
-    `✅ [DEMOS] Updated jobs_demographics row for job ${jobId} with demographics data`
-  );
+  console.log('ℹ️ [DEMOS] Step 4 params:', JSON.stringify(updateParams, null, 2));
+
+  try {
+    await bigquery.query({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+        SET
+          population_no = @population_no,
+          median_age = @median_age,
+          median_income_households = @median_income_households,
+          median_income_families = @median_income_families,
+          male_percentage = @male_percentage,
+          female_percentage = @female_percentage,
+          status = 'completed'
+        WHERE jobId = @jobId
+      `,
+      params: {
+        jobId,
+        population_no: updateParams.population_no,
+        median_age: updateParams.median_age,
+        median_income_households: updateParams.median_income_households,
+        median_income_families: updateParams.median_income_families,
+        male_percentage: updateParams.male_percentage,
+        female_percentage: updateParams.female_percentage,
+      },
+    });
+
+    console.log(
+      `✅ [DEMOS] Updated jobs_demographics row for job ${jobId} with demographics data`
+    );
+  } catch (err) {
+    console.error(
+      `❌ [DEMOS] Error in Step 4 updating jobs_demographics for job ${jobId}:`,
+      JSON.stringify(err.errors || err, null, 2)
+    );
+    // Mark as error so job doesn’t stay pending forever
+    try {
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+          SET status = 'error'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId },
+      });
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+          SET demographicsStatus = 'error'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId },
+      });
+    } catch (markErr) {
+      console.error(
+        '⚠️ [DEMOS] Failed to mark job as error after Step 4 failure:',
+        JSON.stringify(markErr.errors || markErr, null, 2)
+      );
+    }
+    return; // stop further processing for this job
+  }
 
   // ---- Step 5: Update job's demographicsStatus in main table ----
   console.log(
     '➡️ [DEMOS] Step 5: Update client_audits_jobs.demographicsStatus'
   );
 
-  await bigquery.query({
-    query: `
-      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-      SET demographicsStatus = 'completed'
-      WHERE jobId = @jobId
-    `,
-    params: { jobId },
-  });
+  try {
+    await bigquery.query({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET demographicsStatus = 'completed'
+        WHERE jobId = @jobId
+      `,
+      params: { jobId },
+    });
 
-  console.log(
-    `✅ [DEMOS] Marked demographicsStatus = completed for job ${jobId}`
-  );
+    console.log(
+      `✅ [DEMOS] Marked demographicsStatus = completed for job ${jobId}`
+    );
+  } catch (err) {
+    console.error(
+      `❌ [DEMOS] Error in Step 5 updating client_audits_jobs for job ${jobId}:`,
+      JSON.stringify(err.errors || err, null, 2)
+    );
+    return;
+  }
 
   // ---- Step 6: Optionally update main status if all segments done ----
   console.log(
     '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
   );
 
-  await bigquery.query({
-    query: `
-      UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-      SET status = 'completed'
-      WHERE jobId = @jobId
-        AND demographicsStatus = 'completed'
-        AND paidAdsStatus = 'completed'
-    `,
-    params: { jobId },
-  });
+  try {
+    await bigquery.query({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET status = 'completed'
+        WHERE jobId = @jobId
+          AND demographicsStatus = 'completed'
+          AND paidAdsStatus = 'completed'
+      `,
+      params: { jobId },
+    });
 
-  console.log(
-    `ℹ️ [DEMOS] Step 6 checked for full completion for job ${jobId}.`
-  );
-}
+    console.log(
+      `ℹ️ [DEMOS] Step 6 checked for full completion for job ${jobId}.`
+    );
+  } catch (err) {
+    console.error(
+      `❌ [DEMOS] Error in Step 6 updating main status for job ${jobId}:`,
+      JSON.stringify(err.errors || err, null, 2)
+    );
+    // Not fatal, just log it.
+  }
+
 
 // ---------- START SERVER ----------
 const port = process.env.PORT || 8080;
