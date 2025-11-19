@@ -1,23 +1,3 @@
-// worker.js
-
-const express = require('express');
-const { BigQuery } = require('@google-cloud/bigquery');
-
-const app = express();
-const bigquery = new BigQuery();
-
-const PORT = process.env.PORT || 8080;
-
-// ---- CONSTANTS ----
-const PROJECT_ID = 'ghs-construction-1734441714520';
-const JOBS_TABLE = `${PROJECT_ID}.Client_audits.client_audits_jobs`;
-const JOBS_DEMOS_TABLE = `${PROJECT_ID}.Client_audits.jobs_demographics`;
-const DEMOS_SOURCE_TABLE = `${PROJECT_ID}.Client_audits_data.1_demographics`;
-
-// ============================================================================
-//  DEMOGRAPHICS PROCESSOR (your existing function, slightly cleaned up)
-// ============================================================================
-
 async function processJobDemographics(jobId, locationFromMessage) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
@@ -94,8 +74,7 @@ async function processJobDemographics(jobId, locationFromMessage) {
         `❌ [DEMOS] Error inserting pending row for job ${jobId} into jobs_demographics:`,
         JSON.stringify(err.errors || err, null, 2)
       );
-      // don't crash the container; let polling loop continue
-      return;
+      throw err;
     }
   } else {
     console.log(
@@ -238,84 +217,6 @@ async function processJobDemographics(jobId, locationFromMessage) {
       `❌ [DEMOS] Error updating jobs_demographics for job ${jobId}:`,
       JSON.stringify(err.errors || err, null, 2)
     );
-    // don't crash container; polling loop will continue
+    throw err;
   }
 }
-
-// ============================================================================
-//  POLLING LOGIC – find next queued job and process it
-// ============================================================================
-
-async function getNextQueuedJob() {
-  console.log('🔎 [WORKER] Looking for next queued demographics job...');
-
-  const [rows] = await bigquery.query({
-    query: `
-      SELECT jobId, location
-      FROM \`${JOBS_TABLE}\`
-      WHERE demographicsStatus = 'queued'
-      ORDER BY createdAt ASC
-      LIMIT 1
-    `
-  });
-
-  if (!rows.length) {
-    console.log('ℹ️ [WORKER] No queued jobs found.');
-    return null;
-  }
-
-  const job = rows[0];
-
-  // mark as processing to lock it
-  await bigquery.query({
-    query: `
-      UPDATE \`${JOBS_TABLE}\`
-      SET demographicsStatus = 'processing', updatedAt = CURRENT_TIMESTAMP()
-      WHERE jobId = @jobId
-    `,
-    params: { jobId: job.jobId }
-  });
-
-  console.log(`✅ [WORKER] Locked job ${job.jobId} for processing.`);
-  return job;
-}
-
-async function processNextJob() {
-  try {
-    const job = await getNextQueuedJob();
-    if (!job) return; // nothing to do
-
-    await processJobDemographics(job.jobId, job.location);
-  } catch (err) {
-    console.error('❌ [WORKER] Error in processNextJob:', err);
-  }
-}
-
-function startPollingLoop() {
-  const INTERVAL_MS = 10_000;
-
-  const loop = async () => {
-    await processNextJob();
-    setTimeout(loop, INTERVAL_MS);
-  };
-
-  console.log(`🔁 [WORKER] Starting polling loop every ${INTERVAL_MS / 1000}s`);
-  loop();
-}
-
-// ============================================================================
-//  EXPRESS SERVER – required for Cloud Run
-// ============================================================================
-
-app.get('/', (req, res) => {
-  res.send('client-audits-worker is running');
-});
-
-app.get('/healthz', (req, res) => {
-  res.status(200).send('ok');
-});
-
-app.listen(PORT, () => {
-  console.log(`🚀 [WORKER] Listening on port ${PORT}`);
-  startPollingLoop();
-});
