@@ -49,83 +49,41 @@ async function processJobDemographics(jobId) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
   // 🔹 STEP 1: Load job row from client_audits_jobs
-  console.log('➡️ [DEMOS] Step 1: Load job row from client_audits_jobs');
+  try {
+    console.log('➡️ [DEMOS] Step 1: Load job row from client_audits_jobs');
 
-  const [jobRows] = await bigquery.query({
-    query: `
-      SELECT jobId, location
-      FROM \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_TABLE_ID}\`
-      WHERE jobId = @jobId
-      LIMIT 1
-    `,
-    params: { jobId },
-  });
+    const [jobRows] = await bigquery.query({
+      query: `
+        SELECT jobId, location
+        FROM \`${PROJECT_ID}.${JOBS_DATASET_ID}.${JOBS_TABLE_ID}\`
+        WHERE jobId = @jobId
+        LIMIT 1
+      `,
+      params: { jobId },
+    });
 
-  console.log(`ℹ️ [DEMOS] Step 1 result rows: ${jobRows.length}`);
+    console.log(`ℹ️ [DEMOS] Step 1 result rows: ${jobRows.length}`);
 
-  if (!jobRows.length) {
-    console.warn(`⚠️ [DEMOS] No job row found for jobId=${jobId}`);
-    return;
-  }
+    if (!jobRows.length) {
+      console.warn(`⚠️ [DEMOS] No job row found for jobId=${jobId}`);
+      return;
+    }
 
-  const job = jobRows[0];
-  console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${job.location}"`
-  );
+    const job = jobRows[0];
+    console.log(`ℹ️ [DEMOS] Job ${jobId} location = "${job.location}"`);
 
-  // 🔹 STEP 2: Insert / reset pending row in jobs_demographics
-  console.log('➡️ [DEMOS] Step 2: Upsert pending row into jobs_demographics');
+    // 🔹 STEP 2: Insert / reset pending row in jobs_demographics
+    console.log('➡️ [DEMOS] Step 2: Upsert pending row into jobs_demographics');
 
-  const upsertPendingQuery = `
-    BEGIN TRANSACTION;
+    const upsertPendingQuery = `
+      BEGIN TRANSACTION;
 
-    DELETE FROM \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-    WHERE jobId = @jobId;
+      DELETE FROM \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+      WHERE jobId = @jobId;
 
-    INSERT \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\` (
-      jobId,
-      status,
-      location,
-      population_no,
-      households_no,
-      median_age,
-      median_income_households,
-      median_income_families,
-      male_percentage,
-      female_percentage
-    )
-    VALUES (
-      @jobId,
-      'pending',
-      @location,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      NULL,
-      NULL
-    );
-
-    COMMIT TRANSACTION;
-  `;
-
-  await bigquery.query({
-    query: upsertPendingQuery,
-    params: {
-      jobId,
-      location: job.location,
-    },
-  });
-
-  console.log(`✅ [DEMOS] Pending row written for job ${jobId}`);
-
-  // 🔹 STEP 3: Lookup demographics row for the job location
-  console.log('➡️ [DEMOS] Step 3: Lookup demographics row');
-
-  const [demoRows] = await bigquery.query({
-    query: `
-      SELECT
+      INSERT \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\` (
+        jobId,
+        status,
         location,
         population_no,
         households_no,
@@ -134,69 +92,129 @@ async function processJobDemographics(jobId) {
         median_income_families,
         male_percentage,
         female_percentage
-      FROM \`${PROJECT_ID}.${DEMOS_DATASET_ID}.${DEMOS_TABLE_ID}\`
-      WHERE location = @location
-      LIMIT 1
-    `,
-    params: { location: job.location },
-  });
+      )
+      VALUES (
+        @jobId,
+        'pending',
+        @location,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL
+      );
 
-  console.log(`ℹ️ [DEMOS] Step 3 result rows: ${demoRows.length}`);
+      COMMIT TRANSACTION;
+    `;
 
-  if (!demoRows.length) {
-    console.warn(
-      `⚠️ [DEMOS] No demographics row found for location="${job.location}"`
+    await bigquery.query({
+      query: upsertPendingQuery,
+      params: {
+        jobId,
+        location: job.location,
+      },
+    });
+
+    console.log(`✅ [DEMOS] Pending row written for job ${jobId}`);
+
+    // (Optional debug) verify pending row exists
+    const [checkRows] = await bigquery.query({
+      query: `
+        SELECT jobId, status, location
+        FROM \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+        WHERE jobId = @jobId
+        LIMIT 1
+      `,
+      params: { jobId },
+    });
+    console.log(
+      `ℹ️ [DEMOS] Pending row check for job ${jobId}:`,
+      checkRows.length ? checkRows[0] : 'NO ROW'
+    );
+
+    // 🔹 STEP 3: Lookup demographics row for the job location
+    console.log('➡️ [DEMOS] Step 3: Lookup demographics row in 1_demographics');
+
+    const [demoRows] = await bigquery.query({
+      query: `
+        SELECT
+          location,
+          population_no,
+          households_no,
+          median_age,
+          median_income_households,
+          median_income_families,
+          male_percentage,
+          female_percentage
+        FROM \`${PROJECT_ID}.${DEMOS_DATASET_ID}.${DEMOS_TABLE_ID}\`
+        WHERE location = @location
+        LIMIT 1
+      `,
+      params: { location: job.location },
+    });
+
+    console.log(`ℹ️ [DEMOS] Step 3 result rows: ${demoRows.length}`);
+
+    if (!demoRows.length) {
+      console.warn(
+        `⚠️ [DEMOS] No demographics row found for location="${job.location}"`
+      );
+
+      await bigquery.query({
+        query: `
+          UPDATE \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
+          SET status = 'not_found'
+          WHERE jobId = @jobId
+        `,
+        params: { jobId },
+      });
+
+      console.log(
+        `⚠️ [DEMOS] Marked job ${jobId} as not_found in jobs_demographics`
+      );
+      return;
+    }
+
+    const d = demoRows[0];
+
+    // 🔹 STEP 4: Update jobs_demographics with real values
+    console.log(
+      '➡️ [DEMOS] Step 4: Update jobs_demographics with demographics values'
     );
 
     await bigquery.query({
       query: `
         UPDATE \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-        SET status = 'not_found'
+        SET
+          status = 'completed',
+          population_no = @population_no,
+          households_no = @households_no,
+          median_age = @median_age,
+          median_income_households = @median_income_households,
+          median_income_families = @median_income_families,
+          male_percentage = @male_percentage,
+          female_percentage = @female_percentage
         WHERE jobId = @jobId
       `,
-      params: { jobId },
+      params: {
+        jobId,
+        population_no: d.population_no ?? null,
+        households_no: d.households_no ?? null,
+        median_age: d.median_age ?? null,
+        median_income_households: d.median_income_households ?? null,
+        median_income_families: d.median_income_families ?? null,
+        male_percentage: d.male_percentage ?? null,
+        female_percentage: d.female_percentage ?? null,
+      },
     });
 
-    console.log(
-      `⚠️ [DEMOS] Marked job ${jobId} as not_found in jobs_demographics`
-    );
-    return;
+    console.log(`✅ [DEMOS] Completed demographics for job ${jobId}`);
+  } catch (err) {
+    console.error(`❌ [DEMOS] Error in processJobDemographics for job ${jobId}:`, err);
+    throw err; // bubble up so Pub/Sub retries, and we see 500 in logs
   }
-
-  const d = demoRows[0];
-
-  // 🔹 STEP 4: Update jobs_demographics with real values
-  console.log(
-    '➡️ [DEMOS] Step 4: Update jobs_demographics with demographics values'
-  );
-
-  await bigquery.query({
-    query: `
-      UPDATE \`${PROJECT_ID}.${JOBS_DEMOS_DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-      SET
-        status = 'completed',
-        population_no = @population_no,
-        households_no = @households_no,
-        median_age = @median_age,
-        median_income_households = @median_income_households,
-        median_income_families = @median_income_families,
-        male_percentage = @male_percentage,
-        female_percentage = @female_percentage
-      WHERE jobId = @jobId
-    `,
-    params: {
-      jobId,
-      population_no: d.population_no ?? null,
-      households_no: d.households_no ?? null,
-      median_age: d.median_age ?? null,
-      median_income_households: d.median_income_households ?? null,
-      median_income_families: d.median_income_families ?? null,
-      male_percentage: d.male_percentage ?? null,
-      female_percentage: d.female_percentage ?? null,
-    },
-  });
-
-  console.log(`✅ [DEMOS] Completed demographics for job ${jobId}`);
 }
 
 // ---------------- HTTP handler (Pub/Sub push) ----------------
