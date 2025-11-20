@@ -43,18 +43,22 @@ app.post('/', async (req, res) => {
 
     console.log('📩 Received job message:', payload);
 
-    const { jobId, location: locationFromMessage } = payload;
+    const {
+      jobId,
+      location: locationFromMessage,
+      stage = 'demographics', // 👈 default so old messages still work
+    } = payload;
 
     console.log(
-      `✅ Worker received job ${jobId} (location=${locationFromMessage || 'N/A'})`
+      `✅ Worker received job ${jobId} (stage=${stage}, location=${locationFromMessage || 'N/A'})`
     );
 
     if (!jobId) {
-      console.error('❌ [DEMOS] Missing jobId in message payload. Skipping.');
+      console.error('❌ Missing jobId in message payload. Skipping.');
       return res.status(204).send();
     }
 
-    await processJobDemographics(jobId, locationFromMessage || null);
+    await handleJobMessage({ jobId, locationFromMessage: locationFromMessage || null, stage });
 
     // Always ACK so Pub/Sub does not retry this message
     res.status(204).send();
@@ -65,48 +69,73 @@ app.post('/', async (req, res) => {
   }
 });
 
-// ---------- DEMOGRAPHICS PROCESSOR ----------
+// ======================================================================
+//                       MESSAGE ROUTER (MULTI-STAGE)
+// ======================================================================
+
+async function handleJobMessage({ jobId, locationFromMessage, stage }) {
+  try {
+    switch (stage) {
+      case 'demographics':
+        await processJobDemographics(jobId, locationFromMessage);
+        break;
+
+      // 🔜 future:
+      // case 'paidAds':
+      //   await processPaidAdsStage(jobId);
+      //   break;
+
+      default:
+        console.warn(
+          `⚠️ Unknown stage "${stage}" for job ${jobId}. Skipping processing.`
+        );
+    }
+  } catch (err) {
+    console.error(
+      `❌ Error in handleJobMessage for job ${jobId}, stage="${stage}":`,
+      err
+    );
+  }
+}
+
+// ======================================================================
+//                     MAIN DEMOGRAPHICS ENTRYPOINT
+// ======================================================================
 
 async function processJobDemographics(jobId, locationFromMessage = null) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
-  // ---- Step 1: Load job row from client_audits_jobs ----
-  console.log('➡️ [DEMOS] Step 1: Load job row from client_audits_jobs');
+  // Load job using shared helper
+  const job = await loadJob(jobId);
 
-  const [jobRows] = await bigquery.query({
-    query: `
-      SELECT
-        jobId,
-        location,
-        demographicsStatus,
-        paidAdsStatus,
-        status,
-        createdAt
-      FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-      WHERE jobId = @jobId
-      LIMIT 1
-    `,
-    params: { jobId },
-  });
-
-  console.log(`ℹ️ [DEMOS] Step 1 result rows: ${jobRows.length}`);
-
-  if (!jobRows.length) {
+  if (!job) {
     console.warn(
       `⚠️ [DEMOS] Job ${jobId} not found in ${DATASET_ID}.${JOBS_TABLE_ID}.`
     );
     return;
   }
 
-  const job = jobRows[0];
+  await processDemographicsStage(job, locationFromMessage);
+}
+
+// ======================================================================
+//                     DEMOGRAPHICS STAGE PROCESSOR
+// ======================================================================
+
+async function processDemographicsStage(job, locationOverride = null) {
+  const jobId = job.jobId;
   const paidAdsStatus = job.paidAdsStatus || null;
-  const location = job.location || locationFromMessage || null;
+  const location = job.location || locationOverride || null;
 
   // Safely derive the "date" we want to store in jobs_demographics
   const jobDateIso = getSafeJobDateIso(job.createdAt);
 
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt = ${job.createdAt || 'NULL'}`
+    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${
+      job.demographicsStatus
+    }, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt = ${
+      job.createdAt || 'NULL'
+    }`
   );
 
   if (!location) {
@@ -115,35 +144,14 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     );
 
     // Mark main job as failed for demographics
-    await markJobDemographicsStatus(jobId, 'failed');
+    await markSegmentStatus(jobId, 'demographicsStatus', 'failed');
     return;
   }
 
   // ---- Step 2: Mark main job demographicsStatus = pending ----
-  console.log('➡️ [DEMOS] Step 2: Mark main job status = pending');
+  console.log('➡️ [DEMOS] Step 2: Mark main job demographicsStatus = pending');
 
-  try {
-    const [updateJob] = await bigquery.createQueryJob({
-      query: `
-        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-        SET demographicsStatus = 'pending'
-        WHERE jobId = @jobId
-      `,
-      params: { jobId },
-    });
-    const [updateResult] = await updateJob.getQueryResults();
-    console.log(
-      `ℹ️ [DEMOS] Step 2: Updated main job demographicsStatus to 'pending' for job ${jobId} (dmlStats= ${
-        updateResult && updateResult[0] ? JSON.stringify(updateResult[0]) : 'null'
-      }).`
-    );
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error updating main job to pending for job ${jobId}:`,
-      err
-    );
-    // don't hard-fail, continue to try demographics
-  }
+  await markSegmentStatus(jobId, 'demographicsStatus', 'pending');
 
   // ---- Step 3: Load demographics source row ----
   console.log(
@@ -189,7 +197,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       status: 'failed',
     });
 
-    await markJobDemographicsStatus(jobId, 'failed');
+    await markSegmentStatus(jobId, 'demographicsStatus', 'failed');
     return;
   }
 
@@ -297,48 +305,26 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     );
 
     // If insert fails, mark main job as failed
-    await markJobDemographicsStatus(jobId, 'failed');
+    await markSegmentStatus(jobId, 'demographicsStatus', 'failed');
     return;
   }
 
   // ---- Step 5: Update main job's demographicsStatus based on newDemoStatus ----
   console.log('➡️ [DEMOS] Step 5: Update client_audits_jobs.demographicsStatus');
 
-  await markJobDemographicsStatus(jobId, newDemoStatus);
+  await markSegmentStatus(jobId, 'demographicsStatus', newDemoStatus);
 
   // ---- Step 6: Optionally update main job.status if all segments done ----
   console.log(
     '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
   );
 
-  try {
-    if (newDemoStatus === 'completed' && paidAdsStatus === 'completed') {
-      const [statusJob] = await bigquery.createQueryJob({
-        query: `
-          UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-          SET status = 'completed'
-          WHERE jobId = @jobId
-        `,
-        params: { jobId },
-      });
-      await statusJob.getQueryResults();
-      console.log(
-        `ℹ️ [DEMOS] Step 6: Marked main job status='completed' for job ${jobId} (both demographics + paidAds completed).`
-      );
-    } else {
-      console.log(
-        `ℹ️ [DEMOS] Step 6: Main job status NOT set to completed for job ${jobId} (demoStatus=${newDemoStatus}, paidAdsStatus=${paidAdsStatus}).`
-      );
-    }
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error updating main job status for job ${jobId}:`,
-      err
-    );
-  }
+  await maybeMarkJobCompleted(jobId);
 }
 
-// ---------- HELPERS ----------
+// ======================================================================
+//                             HELPERS
+// ======================================================================
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -365,31 +351,118 @@ function getSafeJobDateIso(createdAt) {
   return d.toISOString();
 }
 
-async function markJobDemographicsStatus(jobId, demoStatus) {
-  // demoStatus is expected: 'pending' | 'completed' | 'partial' | 'failed'
+// Load a job row by jobId
+async function loadJob(jobId) {
+  console.log('➡️ [DEMOS] Step 1: Load job row from client_audits_jobs');
+
+  const [jobRows] = await bigquery.query({
+    query: `
+      SELECT
+        jobId,
+        location,
+        demographicsStatus,
+        paidAdsStatus,
+        status,
+        createdAt
+      FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+      WHERE jobId = @jobId
+      LIMIT 1
+    `,
+    params: { jobId },
+  });
+
+  console.log(`ℹ️ [DEMOS] Step 1 result rows: ${jobRows.length}`);
+  if (!jobRows.length) return null;
+  return jobRows[0];
+}
+
+// Mark any segment status on the main jobs table
+async function markSegmentStatus(jobId, segmentField, status) {
+  const allowedFields = ['demographicsStatus', 'paidAdsStatus'];
+  if (!allowedFields.includes(segmentField)) {
+    console.error(
+      `❌ markSegmentStatus: segmentField "${segmentField}" is not allowed`
+    );
+    return;
+  }
+
   try {
     const [job] = await bigquery.createQueryJob({
       query: `
         UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-        SET demographicsStatus = @demoStatus
+        SET ${segmentField} = @status
         WHERE jobId = @jobId
       `,
-      params: { jobId, demoStatus },
+      params: { jobId, status },
     });
     await job.getQueryResults();
     console.log(
-      `✅ [DEMOS] Marked demographicsStatus = '${demoStatus}' for job ${jobId}`
+      `✅ markSegmentStatus: set ${segmentField} = '${status}' for job ${jobId}`
     );
   } catch (err) {
     console.error(
-      `❌ [DEMOS] Error marking demographicsStatus='${demoStatus}' for job ${jobId}:`,
+      `❌ Error setting ${segmentField}='${status}' for job ${jobId}:`,
+      err
+    );
+  }
+}
+
+// If all segments are completed, mark overall job.status = 'completed'
+async function maybeMarkJobCompleted(jobId) {
+  try {
+    const job = await loadJob(jobId);
+    if (!job) {
+      console.warn(
+        `⚠️ maybeMarkJobCompleted: job ${jobId} not found.`
+      );
+      return;
+    }
+
+    const segments = [
+      job.demographicsStatus,
+      job.paidAdsStatus,
+      // later: job.seoStatus, job.websiteStatus, etc.
+    ].filter(Boolean);
+
+    if (!segments.length) {
+      console.log(
+        `ℹ️ maybeMarkJobCompleted: no segment statuses yet for job ${jobId}.`
+      );
+      return;
+    }
+
+    const allCompleted = segments.every((s) => s === 'completed');
+    if (!allCompleted) {
+      console.log(
+        `ℹ️ maybeMarkJobCompleted: not all segments completed for job ${jobId} (segments=${segments.join(
+          ','
+        )}).`
+      );
+      return;
+    }
+
+    const [statusJob] = await bigquery.createQueryJob({
+      query: `
+        UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
+        SET status = 'completed'
+        WHERE jobId = @jobId
+      `,
+      params: { jobId },
+    });
+    await statusJob.getQueryResults();
+    console.log(
+      `ℹ️ maybeMarkJobCompleted: marked job ${jobId} status='completed'.`
+    );
+  } catch (err) {
+    console.error(
+      `❌ maybeMarkJobCompleted: error updating main job status for job ${jobId}:`,
       err
     );
   }
 }
 
 async function overwriteJobsDemographicsRow(jobId, data) {
-  // Convenience for "no data" case
+  // Convenience for "no data" case or full overwrite
   const nowIso = new Date().toISOString();
   const row = {
     jobId: data.jobId,
@@ -417,11 +490,11 @@ async function overwriteJobsDemographicsRow(jobId, data) {
     });
     await deleteJob.getQueryResults();
     console.log(
-      `ℹ️ [DEMOS] overwriteJobsDemographicsRow: deleted existing row(s) for job ${jobId}`
+      `ℹ️ overwriteJobsDemographicsRow: deleted existing row(s) for job ${jobId}`
     );
   } catch (err) {
     console.error(
-      `❌ [DEMOS] overwriteJobsDemographicsRow: error deleting existing rows for job ${jobId}:`,
+      `❌ overwriteJobsDemographicsRow: error deleting existing rows for job ${jobId}:`,
       err
     );
   }
@@ -432,11 +505,11 @@ async function overwriteJobsDemographicsRow(jobId, data) {
       .table(JOBS_DEMOS_TABLE_ID)
       .insert([row], { ignoreUnknownValues: true });
     console.log(
-      `✅ [DEMOS] overwriteJobsDemographicsRow: inserted row for job ${jobId} with status=${row.status}`
+      `✅ overwriteJobsDemographicsRow: inserted row for job ${jobId} with status=${row.status}`
     );
   } catch (err) {
     console.error(
-      `❌ [DEMOS] overwriteJobsDemographicsRow: streaming insert failed for job ${jobId}:`,
+      `❌ overwriteJobsDemographicsRow: streaming insert failed for job ${jobId}:`,
       JSON.stringify(err.errors || err, null, 2)
     );
   }

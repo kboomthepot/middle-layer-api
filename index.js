@@ -34,7 +34,8 @@ async function publishJobEvent(payload) {
 
   const messageId = await topic.publishMessage({ data: dataBuffer });
   console.log(
-    `📨 Published job ${payload.jobId} to Pub/Sub topic "${JOB_EVENTS_TOPIC}" with messageId=${messageId}`
+    `📨 Published job ${payload.jobId} (stage=${payload.stage || 'N/A'}) `
+    + `to Pub/Sub topic "${JOB_EVENTS_TOPIC}" with messageId=${messageId}`
   );
 }
 
@@ -51,6 +52,10 @@ app.post('/jobs', async (req, res) => {
   } = req.body;
 
   const createdAt = new Date().toISOString();
+
+  // For now, we only kick off the demographics stage.
+  // Later you can publish multiple messages (demographics, paidAds, etc.).
+  const stage = 'demographics';
 
   const row = {
     jobId,
@@ -119,8 +124,8 @@ app.post('/jobs', async (req, res) => {
 
     console.log(`✅ Job inserted successfully (DML): ${jobId}`);
 
-    // publish event to worker
-    await publishJobEvent({ jobId, location, createdAt });
+    // publish event to worker (now with stage)
+    await publishJobEvent({ jobId, location, createdAt, stage });
 
     res.json({
       jobId,
