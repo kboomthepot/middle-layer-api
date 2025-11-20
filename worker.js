@@ -20,7 +20,8 @@ const DEMOS_JOBS_TABLE = `${PROJECT_ID}.Client_audits.1_demographicJobs`;
 const ORGANIC_JOBS_TABLE = `${PROJECT_ID}.Client_audits.7_organicSearch_Jobs`;
 
 // N8N WEBHOOK
-const ORGANIC_WEBHOOK_URL = 'https://n8n.srv974379.hstgr.cloud/webhook/07_organicSearch';
+const ORGANIC_WEBHOOK_URL =
+  'https://n8n.srv974379.hstgr.cloud/webhook/07_organicSearch';
 
 /**
  * HELPERS
@@ -37,9 +38,9 @@ async function loadJob(jobId) {
         businessName,
         services,
         location,
-        1_demographics_Status,
-        7_organicSearch_Status,
-        8_paidAds_Status,
+        \`1_demographics_Status\` AS demographicsStatus,
+        \`7_organicSearch_Status\` AS organicSearchStatus,
+        \`8_paidAds_Status\` AS paidAdsStatus,
         website
       FROM \`${JOBS_TABLE}\`
       WHERE jobId = @jobId
@@ -65,15 +66,17 @@ function bqTimestampToIso(ts) {
 
 /**
  * Update a specific "segment status" column (e.g. 1_demographics_Status).
+ * NOTE: we wrap the column name in backticks because it starts with a number.
  */
 async function markSegmentStatus(jobId, statusColumn, newStatus) {
   console.log(
     `✅ markSegmentStatus: set ${statusColumn} = '${newStatus}' for job ${jobId}`
   );
+  const columnName = statusColumn; // e.g. "1_demographics_Status"
   await bigquery.query({
     query: `
       UPDATE \`${JOBS_TABLE}\`
-      SET ${statusColumn} = @newStatus
+      SET \`${columnName}\` = @newStatus
       WHERE jobId = @jobId
     `,
     params: { jobId, newStatus },
@@ -82,10 +85,6 @@ async function markSegmentStatus(jobId, statusColumn, newStatus) {
 
 /**
  * Optionally mark the whole job as completed if all key segments are done.
- * For now we require:
- *   1_demographics_Status = 'completed'
- *   7_organicSearch_Status = 'completed'
- *   8_paidAds_Status      = 'completed'
  */
 async function maybeMarkJobCompleted(jobId) {
   console.log('➡️ Load job row from client_audits_jobs');
@@ -94,9 +93,9 @@ async function maybeMarkJobCompleted(jobId) {
       SELECT
         jobId,
         status,
-        1_demographics_Status,
-        7_organicSearch_Status,
-        8_paidAds_Status
+        \`1_demographics_Status\` AS demographicsStatus,
+        \`7_organicSearch_Status\` AS organicSearchStatus,
+        \`8_paidAds_Status\` AS paidAdsStatus
       FROM \`${JOBS_TABLE}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -109,9 +108,9 @@ async function maybeMarkJobCompleted(jobId) {
 
   const job = rows[0];
 
-  const demo = job['1_demographics_Status'] || 'queued';
-  const organic = job['7_organicSearch_Status'] || 'queued';
-  const paid = job['8_paidAds_Status'] || 'queued';
+  const demo = job.demographicsStatus || 'queued';
+  const organic = job.organicSearchStatus || 'queued';
+  const paid = job.paidAdsStatus || 'queued';
 
   console.log(
     `ℹ️ maybeMarkJobCompleted: current segments for ${jobId} => demo=${demo}, organic=${organic}, paid=${paid}`
@@ -276,7 +275,7 @@ async function handleDemographicsStage(jobId) {
   const createdAtIso = bqTimestampToIso(job.createdAt);
 
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${job.location}", demographicsStatus = ${job['1_demographics_Status']}, organicSearchStatus = ${job['7_organicSearch_Status']}, paidAdsStatus = ${job['8_paidAds_Status']}, status = ${job.status}, createdAt = ${JSON.stringify(
+    `ℹ️ [DEMOS] Job ${jobId} location = "${job.location}", demographicsStatus = ${job.demographicsStatus}, organicSearchStatus = ${job.organicSearchStatus}, paidAdsStatus = ${job.paidAdsStatus}, status = ${job.status}, createdAt = ${JSON.stringify(
       job.createdAt
     )}`
   );
@@ -360,7 +359,9 @@ async function handleDemographicsStage(jobId) {
     return;
   }
 
-  console.log('➡️ [DEMOS] Step 5: Update client_audits_jobs.1_demographics_Status');
+  console.log(
+    '➡️ [DEMOS] Step 5: Update client_audits_jobs.1_demographics_Status'
+  );
   await markSegmentStatus(jobId, '1_demographics_Status', 'completed');
 
   console.log(
@@ -392,7 +393,7 @@ async function handleOrganicStage(jobId) {
   }
 
   console.log(
-    `ℹ️ [ORG] Job ${jobId} location = "${job.location}", organicSearchStatus = ${job['7_organicSearch_Status']}, services = ${JSON.stringify(
+    `ℹ️ [ORG] Job ${jobId} location = "${job.location}", organicSearchStatus = ${job.organicSearchStatus}, services = ${JSON.stringify(
       servicesArray
     )}`
   );
@@ -525,7 +526,6 @@ app.post('/organic-result', async (req, res) => {
         );
       }
 
-      // Mark organic segment complete regardless of merge outcome for now
       await markSegmentStatus(jobId, '7_organicSearch_Status', 'completed');
       await maybeMarkJobCompleted(jobId);
     }
@@ -539,7 +539,6 @@ app.post('/organic-result', async (req, res) => {
 
 /**
  * PUB/SUB PUSH ENDPOINT
- * Google Pub/Sub will POST here with base64-encoded data.
  */
 app.post('/', async (req, res) => {
   try {
@@ -575,7 +574,7 @@ app.post('/', async (req, res) => {
       console.log(`ℹ️ Unknown stage "${stage}" - nothing to do yet.`);
     }
 
-    res.status(204).send(); // Pub/Sub requires a 2xx
+    res.status(204).send();
   } catch (err) {
     console.error('❌ Error handling Pub/Sub message:', err);
     res.status(500).send();
