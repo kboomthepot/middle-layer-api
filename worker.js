@@ -17,6 +17,10 @@ const DEMOS_SOURCE_TABLE_ID = '1_demographics';
 // Demographics jobs table (target)
 const JOBS_DEMOS_TABLE_ID = 'jobs_demographics';
 
+// n8n webhook for organic search
+const ORGANIC_WEBHOOK_URL =
+  'https://n8n.srv974379.hstgr.cloud/webhook/07_organicSearch';
+
 const bigquery = new BigQuery({ projectId: PROJECT_ID });
 
 const app = express();
@@ -46,7 +50,7 @@ app.post('/', async (req, res) => {
     const {
       jobId,
       location: locationFromMessage,
-      stage = 'demographics', // 👈 default so old messages still work
+      stage = 'demographics', // default so old messages still work
     } = payload;
 
     console.log(
@@ -58,7 +62,11 @@ app.post('/', async (req, res) => {
       return res.status(204).send();
     }
 
-    await handleJobMessage({ jobId, locationFromMessage: locationFromMessage || null, stage });
+    await handleJobMessage({
+      jobId,
+      locationFromMessage: locationFromMessage || null,
+      stage,
+    });
 
     // Always ACK so Pub/Sub does not retry this message
     res.status(204).send();
@@ -78,6 +86,11 @@ async function handleJobMessage({ jobId, locationFromMessage, stage }) {
     switch (stage) {
       case 'demographics':
         await processJobDemographics(jobId, locationFromMessage);
+        break;
+
+      case '7_organicSearch':
+      case 'organicSearch':
+        await processOrganicSearchStage(jobId);
         break;
 
       // 🔜 future:
@@ -119,6 +132,84 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
 }
 
 // ======================================================================
+//                ORGANIC SEARCH STAGE → CALL n8n WEBHOOK
+// ======================================================================
+
+async function processOrganicSearchStage(jobId) {
+  console.log(`▶️ [ORG] Starting organic search processing for job ${jobId}`);
+
+  const job = await loadJob(jobId);
+  if (!job) {
+    console.warn(
+      `⚠️ [ORG] Job ${jobId} not found in ${DATASET_ID}.${JOBS_TABLE_ID}.`
+    );
+    return;
+  }
+
+  const location = job.location || null;
+
+  let servicesArray = [];
+  if (job.services) {
+    try {
+      // services is stored as JSON string in jobs table
+      servicesArray = JSON.parse(job.services);
+      if (!Array.isArray(servicesArray)) {
+        servicesArray = [servicesArray];
+      }
+    } catch (err) {
+      console.warn(
+        `⚠️ [ORG] Could not parse services JSON for job ${jobId}:`,
+        err
+      );
+      servicesArray = [];
+    }
+  }
+
+  const body = {
+    jobId,
+    location,
+    services: servicesArray,
+  };
+
+  console.log(
+    `ℹ️ [ORG] Sending payload to n8n webhook: ${ORGANIC_WEBHOOK_URL} →`,
+    JSON.stringify(body)
+  );
+
+  try {
+    // Node 18+ has global fetch available
+    const response = await fetch(ORGANIC_WEBHOOK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    const text = await response.text();
+
+    if (!response.ok) {
+      console.error(
+        `❌ [ORG] n8n webhook responded with status ${response.status}:`,
+        text
+      );
+    } else {
+      console.log(
+        `✅ [ORG] n8n webhook call succeeded for job ${jobId}. Response:`,
+        text
+      );
+    }
+  } catch (err) {
+    console.error(`❌ [ORG] Error calling n8n webhook for job ${jobId}:`, err);
+  }
+
+  // NOTE (for now):
+  // - We are NOT updating 7_organicSearchStatus yet.
+  // - It stays 'queued' until we add a callback from n8n that
+  //   marks it 'completed' or 'failed'.
+}
+
+// ======================================================================
 //                     DEMOGRAPHICS STAGE PROCESSOR
 // ======================================================================
 
@@ -133,7 +224,9 @@ async function processDemographicsStage(job, locationOverride = null) {
   console.log(
     `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${
       job.demographicsStatus
-    }, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt = ${
+    }, paidAdsStatus = ${paidAdsStatus}, organicSearchStatus = ${
+      job.organicSearchStatus
+    }, status = ${job.status}, createdAt = ${
       job.createdAt || 'NULL'
     }`
   );
@@ -353,15 +446,17 @@ function getSafeJobDateIso(createdAt) {
 
 // Load a job row by jobId
 async function loadJob(jobId) {
-  console.log('➡️ [DEMOS] Step 1: Load job row from client_audits_jobs');
+  console.log('➡️ Load job row from client_audits_jobs');
 
   const [jobRows] = await bigquery.query({
     query: `
       SELECT
         jobId,
         location,
+        services,
         demographicsStatus,
         paidAdsStatus,
+        \`7_organicSearchStatus\` AS organicSearchStatus,
         status,
         createdAt
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
@@ -371,15 +466,23 @@ async function loadJob(jobId) {
     params: { jobId },
   });
 
-  console.log(`ℹ️ [DEMOS] Step 1 result rows: ${jobRows.length}`);
+  console.log(`ℹ️ loadJob result rows: ${jobRows.length}`);
   if (!jobRows.length) return null;
   return jobRows[0];
 }
 
 // Mark any segment status on the main jobs table
 async function markSegmentStatus(jobId, segmentField, status) {
-  const allowedFields = ['demographicsStatus', 'paidAdsStatus'];
-  if (!allowedFields.includes(segmentField)) {
+  // segmentField is one of our logical keys:
+  // 'demographicsStatus' | 'paidAdsStatus' | 'organicSearchStatus'
+  const fieldMap = {
+    demographicsStatus: 'demographicsStatus',
+    paidAdsStatus: 'paidAdsStatus',
+    organicSearchStatus: '7_organicSearchStatus',
+  };
+
+  const columnName = fieldMap[segmentField];
+  if (!columnName) {
     console.error(
       `❌ markSegmentStatus: segmentField "${segmentField}" is not allowed`
     );
@@ -390,14 +493,14 @@ async function markSegmentStatus(jobId, segmentField, status) {
     const [job] = await bigquery.createQueryJob({
       query: `
         UPDATE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-        SET ${segmentField} = @status
+        SET \`${columnName}\` = @status
         WHERE jobId = @jobId
       `,
       params: { jobId, status },
     });
     await job.getQueryResults();
     console.log(
-      `✅ markSegmentStatus: set ${segmentField} = '${status}' for job ${jobId}`
+      `✅ markSegmentStatus: set ${segmentField} (column ${columnName}) = '${status}' for job ${jobId}`
     );
   } catch (err) {
     console.error(
@@ -407,7 +510,7 @@ async function markSegmentStatus(jobId, segmentField, status) {
   }
 }
 
-// If all segments are completed, mark overall job.status = 'completed'
+// If all processed segments are completed, mark overall job.status = 'completed'
 async function maybeMarkJobCompleted(jobId) {
   try {
     const job = await loadJob(jobId);
@@ -418,15 +521,22 @@ async function maybeMarkJobCompleted(jobId) {
       return;
     }
 
-    const segments = [
-      job.demographicsStatus,
-      job.paidAdsStatus,
-      // later: job.seoStatus, job.websiteStatus, etc.
-    ].filter(Boolean);
+    // Only consider segments that have actually been processed
+    // (i.e. not 'queued' and not null)
+    const rawSegments = {
+      demographicsStatus: job.demographicsStatus,
+      paidAdsStatus: job.paidAdsStatus,
+      organicSearchStatus: job.organicSearchStatus,
+      // later: seoStatus, etc.
+    };
+
+    const segments = Object.values(rawSegments).filter(
+      (s) => s && s !== 'queued'
+    );
 
     if (!segments.length) {
       console.log(
-        `ℹ️ maybeMarkJobCompleted: no segment statuses yet for job ${jobId}.`
+        `ℹ️ maybeMarkJobCompleted: no processed segment statuses yet for job ${jobId}.`
       );
       return;
     }
@@ -434,7 +544,7 @@ async function maybeMarkJobCompleted(jobId) {
     const allCompleted = segments.every((s) => s === 'completed');
     if (!allCompleted) {
       console.log(
-        `ℹ️ maybeMarkJobCompleted: not all segments completed for job ${jobId} (segments=${segments.join(
+        `ℹ️ maybeMarkJobCompleted: not all processed segments completed for job ${jobId} (segments=${segments.join(
           ','
         )}).`
       );

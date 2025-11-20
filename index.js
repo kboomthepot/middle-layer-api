@@ -54,7 +54,6 @@ app.post('/jobs', async (req, res) => {
   const createdAt = new Date().toISOString();
 
   // For now, we only kick off the demographics stage.
-  // Later you can publish multiple messages (demographics, paidAds, etc.).
   const stage = 'demographics';
 
   const row = {
@@ -82,6 +81,7 @@ app.post('/jobs', async (req, res) => {
     // section statuses
     demographicsStatus: 'queued',
     paidAdsStatus: 'queued',
+    organicSearchStatus: 'queued', // maps to BigQuery column `7_organicSearchStatus`
 
     createdAt,
   };
@@ -93,12 +93,12 @@ app.post('/jobs', async (req, res) => {
         (jobId, firstName, lastName, email, phone,
          businessName, website, services,
          revenue, budget, location,
-         status, demographicsStatus, paidAdsStatus, createdAt)
+         status, demographicsStatus, paidAdsStatus, \`7_organicSearchStatus\`, createdAt)
       VALUES
         (@jobId, @firstName, @lastName, @email, @phone,
          @businessName, @website, @services,
          @revenue, @budget, @location,
-         @status, @demographicsStatus, @paidAdsStatus, @createdAt)
+         @status, @demographicsStatus, @paidAdsStatus, @organicSearchStatus, @createdAt)
     `;
 
     await bigquery.query({
@@ -118,6 +118,7 @@ app.post('/jobs', async (req, res) => {
         status: row.status,
         demographicsStatus: row.demographicsStatus,
         paidAdsStatus: row.paidAdsStatus,
+        organicSearchStatus: row.organicSearchStatus,
         createdAt: row.createdAt,
       },
     });
@@ -132,6 +133,7 @@ app.post('/jobs', async (req, res) => {
       status: 'queued',
       demographicsStatus: 'queued',
       paidAdsStatus: 'queued',
+      organicSearchStatus: 'queued',
     });
   } catch (err) {
     console.error('❌ BigQuery Insert Error (DML):', err);
@@ -147,7 +149,11 @@ app.get('/status', async (req, res) => {
 
   const query = {
     query: `
-      SELECT status, demographicsStatus, paidAdsStatus
+      SELECT
+        status,
+        demographicsStatus,
+        paidAdsStatus,
+        \`7_organicSearchStatus\` AS organicSearchStatus
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -165,6 +171,7 @@ app.get('/status', async (req, res) => {
       status: row.status,
       demographicsStatus: row.demographicsStatus,
       paidAdsStatus: row.paidAdsStatus,
+      organicSearchStatus: row.organicSearchStatus,
     });
   } catch (err) {
     console.error('Failed to fetch job status:', err);
