@@ -336,7 +336,7 @@ async function processDemographicsStage(job, locationOverride = null) {
           @female_percentage AS female_percentage,
           @status AS status,
           TIMESTAMP(@date) AS date,
-          NULL AS businessName
+          CAST(NULL AS STRING) AS businessName
       ) S
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
@@ -574,7 +574,7 @@ async function overwriteJobsDemographicsRow(jobId, data) {
           @female_percentage AS female_percentage,
           @status AS status,
           TIMESTAMP(@date) AS date,
-          NULL AS businessName
+          CAST(NULL AS STRING) AS businessName
       ) S
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
