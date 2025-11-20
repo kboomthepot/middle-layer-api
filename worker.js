@@ -53,7 +53,9 @@ app.post('/', async (req, res) => {
     } = payload;
 
     console.log(
-      `✅ Worker received job ${jobId} (stage=${stage}, location=${locationFromMessage || 'N/A'})`
+      `✅ Worker received job ${jobId} (stage=${stage}, location=${
+        locationFromMessage || 'N/A'
+      })`
     );
 
     if (!jobId) {
@@ -319,8 +321,6 @@ async function processDemographicsStage(job, locationOverride = null) {
       `status=${newDemoStatus}, date=${jobDateIso}`
   );
 
-  const nowIso = new Date().toISOString();
-
   try {
     const mergeQuery = `
       MERGE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\` T
@@ -335,9 +335,8 @@ async function processDemographicsStage(job, locationOverride = null) {
           @male_percentage AS male_percentage,
           @female_percentage AS female_percentage,
           @status AS status,
-          @date AS date,
-          @createdAt AS createdAt,
-          @updatedAt AS updatedAt
+          TIMESTAMP(@date) AS date,
+          NULL AS businessName
       ) S
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
@@ -350,16 +349,16 @@ async function processDemographicsStage(job, locationOverride = null) {
           male_percentage = S.male_percentage,
           female_percentage = S.female_percentage,
           status = S.status,
-          date = S.date,
-          createdAt = S.createdAt,
-          updatedAt = S.updatedAt
+          date = S.date
       WHEN NOT MATCHED THEN
-        INSERT (jobId, population_no, median_age, households_no,
+        INSERT (jobId, date, status, businessName,
+                population_no, households_no, median_age,
                 median_income_households, median_income_families,
-                male_percentage, female_percentage, status, date, createdAt, updatedAt)
-        VALUES (S.jobId, S.population_no, S.median_age, S.households_no,
+                male_percentage, female_percentage)
+        VALUES (S.jobId, S.date, S.status, S.businessName,
+                S.population_no, S.households_no, S.median_age,
                 S.median_income_households, S.median_income_families,
-                S.male_percentage, S.female_percentage, S.status, S.date, S.createdAt, S.updatedAt)
+                S.male_percentage, S.female_percentage)
     `;
 
     const [mergeJob] = await bigquery.createQueryJob({
@@ -375,8 +374,6 @@ async function processDemographicsStage(job, locationOverride = null) {
         female_percentage: parsed.female_percentage,
         status: newDemoStatus,
         date: jobDateIso,
-        createdAt: nowIso,
-        updatedAt: nowIso,
       },
     });
     await mergeJob.getQueryResults();
@@ -560,21 +557,7 @@ async function maybeMarkJobCompleted(jobId) {
 }
 
 async function overwriteJobsDemographicsRow(jobId, data) {
-  const nowIso = new Date().toISOString();
-  const row = {
-    jobId: data.jobId,
-    population_no: data.population_no ?? null,
-    median_age: data.median_age ?? null,
-    households_no: data.households_no ?? null,
-    median_income_households: data.median_income_households ?? null,
-    median_income_families: data.median_income_families ?? null,
-    male_percentage: data.male_percentage ?? null,
-    female_percentage: data.female_percentage ?? null,
-    status: data.status || 'failed',
-    date: data.date || nowIso,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-  };
+  const rowDateIso = data.date || new Date().toISOString();
 
   try {
     const mergeQuery = `
@@ -590,9 +573,8 @@ async function overwriteJobsDemographicsRow(jobId, data) {
           @male_percentage AS male_percentage,
           @female_percentage AS female_percentage,
           @status AS status,
-          @date AS date,
-          @createdAt AS createdAt,
-          @updatedAt AS updatedAt
+          TIMESTAMP(@date) AS date,
+          NULL AS businessName
       ) S
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
@@ -605,39 +587,38 @@ async function overwriteJobsDemographicsRow(jobId, data) {
           male_percentage = S.male_percentage,
           female_percentage = S.female_percentage,
           status = S.status,
-          date = S.date,
-          createdAt = S.createdAt,
-          updatedAt = S.updatedAt
+          date = S.date
       WHEN NOT MATCHED THEN
-        INSERT (jobId, population_no, median_age, households_no,
+        INSERT (jobId, date, status, businessName,
+                population_no, households_no, median_age,
                 median_income_households, median_income_families,
-                male_percentage, female_percentage, status, date, createdAt, updatedAt)
-        VALUES (S.jobId, S.population_no, S.median_age, S.households_no,
+                male_percentage, female_percentage)
+        VALUES (S.jobId, S.date, S.status, S.businessName,
+                S.population_no, S.households_no, S.median_age,
                 S.median_income_households, S.median_income_families,
-                S.male_percentage, S.female_percentage, S.status, S.date, S.createdAt, S.updatedAt)
+                S.male_percentage, S.female_percentage)
     `;
 
     const [mergeJob] = await bigquery.createQueryJob({
       query: mergeQuery,
       params: {
-        jobId: row.jobId,
-        population_no: row.population_no,
-        median_age: row.median_age,
-        households_no: row.households_no,
-        median_income_households: row.median_income_households,
-        median_income_families: row.median_income_families,
-        male_percentage: row.male_percentage,
-        female_percentage: row.female_percentage,
-        status: row.status,
-        date: row.date,
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt,
+        jobId,
+        population_no: data.population_no ?? null,
+        median_age: data.median_age ?? null,
+        households_no: data.households_no ?? null,
+        median_income_households: data.median_income_households ?? null,
+        median_income_families: data.median_income_families ?? null,
+        male_percentage: data.male_percentage ?? null,
+        female_percentage: data.female_percentage ?? null,
+        status: data.status || 'failed',
+        date: rowDateIso,
       },
     });
     await mergeJob.getQueryResults();
 
     console.log(
-      `✅ overwriteJobsDemographicsRow: MERGE row for job ${jobId} with status=${row.status}`
+      `✅ overwriteJobsDemographicsRow: MERGE row for job ${jobId} with status=${data.status ||
+        'failed'}`
     );
   } catch (err) {
     console.error(
