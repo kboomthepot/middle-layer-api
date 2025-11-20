@@ -43,7 +43,7 @@ app.post('/', async (req, res) => {
 
     console.log('📩 Received job message:', payload);
 
-    const { jobId, location: locationFromMessage, createdAt } = payload;
+    const { jobId, location: locationFromMessage } = payload;
 
     console.log(
       `✅ Worker received job ${jobId} (location=${locationFromMessage || 'N/A'})`
@@ -80,7 +80,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
         location,
         demographicsStatus,
         paidAdsStatus,
-        status
+        status,
+        createdAt
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -101,8 +102,13 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const paidAdsStatus = job.paidAdsStatus || null;
   const location = job.location || locationFromMessage || null;
 
+  // Normalize createdAt from jobs table (will be stored as "date" in jobs_demographics)
+  const jobCreatedAtIso = job.createdAt
+    ? new Date(job.createdAt).toISOString()
+    : null;
+
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}`
+    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt=${jobCreatedAtIso}`
   );
 
   if (!location) {
@@ -181,7 +187,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       male_percentage: null,
       female_percentage: null,
       status: 'failed',
-    });
+      // date will be filled from jobCreatedAtIso inside helper
+    }, jobCreatedAtIso);
 
     await markJobDemographicsStatus(jobId, 'failed');
     return;
@@ -225,9 +232,10 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   else if (allNonNull) newDemoStatus = 'completed';
   else newDemoStatus = 'partial';
 
+  // Cleaner Step 4 log – just the parsed values
   console.log(
-    `ℹ️ [DEMOS] Step 4 computed metrics for job ${jobId}:`,
-    JSON.stringify(parsed),
+    `ℹ️ [DEMOS] Step 4 metrics for job ${jobId}:`,
+    parsed,
     `=> newDemoStatus="${newDemoStatus}"`
   );
 
@@ -264,13 +272,15 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     male_percentage: parsed.male_percentage,
     female_percentage: parsed.female_percentage,
     status: newDemoStatus,
+    // 👇 store original job createdAt from client_audits_jobs into "date"
+    date: jobCreatedAtIso,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
 
   console.log(
     `ℹ️ [DEMOS] Step 4 rowToInsert for job ${jobId}:`,
-    JSON.stringify(rowToInsert)
+    rowToInsert
   );
 
   try {
@@ -306,7 +316,8 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
           median_income_families,
           male_percentage,
           female_percentage,
-          status
+          status,
+          date
         FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
         WHERE jobId = @jobId
         LIMIT 1
@@ -314,10 +325,31 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       params: { jobId },
     });
 
-    console.log(
-      `ℹ️ [DEMOS] Step 4 check row for job ${jobId}:`,
-      checkRows[0] || null
-    );
+    const r = checkRows[0] || null;
+
+    // 👇 Cleaned-up log: convert Big values to string/number and show only useful fields
+    if (r) {
+      console.log(
+        `ℹ️ [DEMOS] Step 4 check row for job ${jobId}:`,
+        {
+          jobId: r.jobId,
+          location: r.location,
+          population_no: r.population_no?.toString?.() ?? r.population_no,
+          median_age: r.median_age?.toString?.() ?? r.median_age,
+          median_income_households:
+            r.median_income_households?.toString?.() ?? r.median_income_households,
+          median_income_families:
+            r.median_income_families?.toString?.() ?? r.median_income_families,
+          male_percentage: r.male_percentage?.toString?.() ?? r.male_percentage,
+          female_percentage:
+            r.female_percentage?.toString?.() ?? r.female_percentage,
+          status: r.status,
+          date: r.date,
+        }
+      );
+    } else {
+      console.log(`ℹ️ [DEMOS] Step 4 check row for job ${jobId}: null`);
+    }
   } catch (err) {
     console.error(
       `❌ [DEMOS] Error verifying jobs_demographics row for job ${jobId}:`,
@@ -394,7 +426,7 @@ async function markJobDemographicsStatus(jobId, demoStatus) {
   }
 }
 
-async function overwriteJobsDemographicsRow(jobId, data) {
+async function overwriteJobsDemographicsRow(jobId, data, jobCreatedAtIso = null) {
   // Convenience for "no data" case
   const nowIso = new Date().toISOString();
   const row = {
@@ -407,6 +439,8 @@ async function overwriteJobsDemographicsRow(jobId, data) {
     male_percentage: data.male_percentage ?? null,
     female_percentage: data.female_percentage ?? null,
     status: data.status || 'failed',
+    // 👇 keep date aligned with client_audits_jobs.createdAt
+    date: jobCreatedAtIso,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
