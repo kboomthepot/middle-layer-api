@@ -15,9 +15,12 @@ const DEMOS_DATASET_ID = 'Client_audits_data';
 const DEMOS_SOURCE_TABLE_ID = '1_demographics';
 
 // Demographics jobs table (target)
-const JOBS_DEMOS_TABLE_ID = '1_demographicJobs';
+const DEMO_JOBS_TABLE_ID = '1_demographicJobs';
 
-// n8n webhook for organic search
+// Organic search jobs table (target)
+const ORGANIC_JOBS_TABLE_ID = '7_organicSearch_Jobs';
+
+// n8n webhook for organic search (used when TRIGGERING n8n)
 const ORGANIC_WEBHOOK_URL =
   'https://n8n.srv974379.hstgr.cloud/webhook/07_organicSearch';
 
@@ -31,7 +34,9 @@ app.get('/', (req, res) => {
   res.send('Worker service listening on port 8080');
 });
 
-// ---------- PUB/SUB ENDPOINT ----------
+// ======================================================================
+//                   1) PUB/SUB ENTRYPOINT  (DEMOS + ORGANIC TRIGGER)
+// ======================================================================
 app.post('/', async (req, res) => {
   try {
     const envelope = req.body;
@@ -77,6 +82,31 @@ app.post('/', async (req, res) => {
 });
 
 // ======================================================================
+//           2) HTTP CALLBACK ENTRYPOINT FOR ORGANIC RESULTS (n8n)
+// ======================================================================
+// n8n will POST the array you showed here.
+app.post('/organic-result', async (req, res) => {
+  try {
+    const body = req.body;
+
+    const items = Array.isArray(body) ? body : [body];
+
+    console.log(
+      `📥 [/organic-result] Received ${items.length} organic result item(s)`
+    );
+
+    for (const item of items) {
+      await processOrganicResultCallback(item);
+    }
+
+    res.json({ ok: true, processed: items.length });
+  } catch (err) {
+    console.error('❌ Error in /organic-result handler:', err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// ======================================================================
 //                       MESSAGE ROUTER (MULTI-STAGE)
 // ======================================================================
 
@@ -85,7 +115,7 @@ async function handleJobMessage({ jobId, locationFromMessage, stage }) {
     switch (stage) {
       case 'demographics':
         await processJobDemographics(jobId, locationFromMessage);
-        break;
+      	break;
 
       case '7_organicSearch':
       case 'organicSearch':
@@ -106,7 +136,7 @@ async function handleJobMessage({ jobId, locationFromMessage, stage }) {
 }
 
 // ======================================================================
-//                ORGANIC SEARCH STAGE → CALL n8n WEBHOOK
+//                ORGANIC SEARCH STAGE → TRIGGER n8n
 // ======================================================================
 
 async function processOrganicSearchStage(jobId) {
@@ -173,8 +203,246 @@ async function processOrganicSearchStage(jobId) {
     console.error(`❌ [ORG] Error calling n8n webhook for job ${jobId}:`, err);
   }
 
-  // later: when 7_organicSearch_Jobs is filled + callback wired,
-  // we'll update 7_organicSearch_Status here.
+  // The actual write to 7_organicSearch_Jobs happens when n8n calls /organic-result
+}
+
+// ======================================================================
+//       ORGANIC SEARCH CALLBACK: WRITE 7_organicSearch_Jobs + STATUS
+// ======================================================================
+
+async function processOrganicResultCallback(result) {
+  const {
+    jobId,
+    services,
+    location,
+    rank1Name,
+    rank1Url,
+    rank2Name,
+    rank2Url,
+    rank3Name,
+    rank3Url,
+    rank4Name,
+    rank4Url,
+    rank5Name,
+    rank5Url,
+    rank6Name,
+    rank6Url,
+    rank7Name,
+    rank7Url,
+    rank8Name,
+    rank8Url,
+    rank9Name,
+    rank9Url,
+    rank10Name,
+    rank10Url,
+  } = result;
+
+  if (!jobId) {
+    console.warn('⚠️ [/organic-result] Missing jobId in payload. Skipping row.');
+    return;
+  }
+
+  console.log(
+    `▶️ [ORG-CB] Processing organic callback for job ${jobId} (location=${location}, services=${services})`
+  );
+
+  // Load job to get createdAt (so we can store a consistent date)
+  const job = await loadJob(jobId);
+  if (!job) {
+    console.warn(
+      `⚠️ [ORG-CB] Job ${jobId} not found when writing organic results.`
+    );
+    return;
+  }
+
+  const jobDateIso = getSafeJobDateIso(job.createdAt);
+
+  // Upsert the organic results row
+  await upsertOrganicRow({
+    jobId,
+    dateIso: jobDateIso,
+    status: 'completed', // you can adjust later if you add error cases
+    rank1Name,
+    rank1Url,
+    rank2Name,
+    rank2Url,
+    rank3Name,
+    rank3Url,
+    rank4Name,
+    rank4Url,
+    rank5Name,
+    rank5Url,
+    rank6Name,
+    rank6Url,
+    rank7Name,
+    rank7Url,
+    rank8Name,
+    rank8Url,
+    rank9Name,
+    rank9Url,
+    rank10Name,
+    rank10Url,
+  });
+
+  // Update main job segment status → 7_organicSearch_Status
+  await markSegmentStatus(jobId, 'organicSearchStatus', 'completed');
+
+  // Check if all required segments are now completed
+  await maybeMarkJobCompleted(jobId);
+}
+
+async function upsertOrganicRow(data) {
+  const {
+    jobId,
+    dateIso,
+    status,
+    rank1Name,
+    rank1Url,
+    rank2Name,
+    rank2Url,
+    rank3Name,
+    rank3Url,
+    rank4Name,
+    rank4Url,
+    rank5Name,
+    rank5Url,
+    rank6Name,
+    rank6Url,
+    rank7Name,
+    rank7Url,
+    rank8Name,
+    rank8Url,
+    rank9Name,
+    rank9Url,
+    rank10Name,
+    rank10Url,
+  } = data;
+
+  console.log(
+    `ℹ️ [ORG-CB] Upserting organic results for job ${jobId} into ${DATASET_ID}.${ORGANIC_JOBS_TABLE_ID}`
+  );
+
+  const mergeQuery = `
+    MERGE \`${PROJECT_ID}.${DATASET_ID}.${ORGANIC_JOBS_TABLE_ID}\` T
+    USING (
+      SELECT
+        @jobId       AS jobId,
+        TIMESTAMP(@dateIso) AS date,
+        @status      AS status,
+        @rank1Name   AS rank1Name,
+        @rank1Url    AS rank1Url,
+        @rank2Name   AS rank2Name,
+        @rank2Url    AS rank2Url,
+        @rank3Name   AS rank3Name,
+        @rank3Url    AS rank3Url,
+        @rank4Name   AS rank4Name,
+        @rank4Url    AS rank4Url,
+        @rank5Name   AS rank5Name,
+        @rank5Url    AS rank5Url,
+        @rank6Name   AS rank6Name,
+        @rank6Url    AS rank6Url,
+        @rank7Name   AS rank7Name,
+        @rank7Url    AS rank7Url,
+        @rank8Name   AS rank8Name,
+        @rank8Url    AS rank8Url,
+        @rank9Name   AS rank9Name,
+        @rank9Url    AS rank9Url,
+        @rank10Name  AS rank10Name,
+        @rank10Url   AS rank10Url
+    ) S
+    ON T.jobId = S.jobId
+    WHEN MATCHED THEN
+      UPDATE SET
+        date       = S.date,
+        status     = S.status,
+        rank1Name  = S.rank1Name,
+        rank1Url   = S.rank1Url,
+        rank2Name  = S.rank2Name,
+        rank2Url   = S.rank2Url,
+        rank3Name  = S.rank3Name,
+        rank3Url   = S.rank3Url,
+        rank4Name  = S.rank4Name,
+        rank4Url   = S.rank4Url,
+        rank5Name  = S.rank5Name,
+        rank5Url   = S.rank5Url,
+        rank6Name  = S.rank6Name,
+        rank6Url   = S.rank6Url,
+        rank7Name  = S.rank7Name,
+        rank7Url   = S.rank7Url,
+        rank8Name  = S.rank8Name,
+        rank8Url   = S.rank8Url,
+        rank9Name  = S.rank9Name,
+        rank9Url   = S.rank9Url,
+        rank10Name = S.rank10Name,
+        rank10Url  = S.rank10Url
+    WHEN NOT MATCHED THEN
+      INSERT (
+        jobId, date, status,
+        rank1Name, rank1Url,
+        rank2Name, rank2Url,
+        rank3Name, rank3Url,
+        rank4Name, rank4Url,
+        rank5Name, rank5Url,
+        rank6Name, rank6Url,
+        rank7Name, rank7Url,
+        rank8Name, rank8Url,
+        rank9Name, rank9Url,
+        rank10Name, rank10Url
+      )
+      VALUES (
+        S.jobId, S.date, S.status,
+        S.rank1Name, S.rank1Url,
+        S.rank2Name, S.rank2Url,
+        S.rank3Name, S.rank3Url,
+        S.rank4Name, S.rank4Url,
+        S.rank5Name, S.rank5Url,
+        S.rank6Name, S.rank6Url,
+        S.rank7Name, S.rank7Url,
+        S.rank8Name, S.rank8Url,
+        S.rank9Name, S.rank9Url,
+        S.rank10Name, S.rank10Url
+      )
+  `;
+
+  try {
+    const [mergeJob] = await bigquery.createQueryJob({
+      query: mergeQuery,
+      params: {
+        jobId,
+        dateIso,
+        status,
+        rank1Name: rank1Name || null,
+        rank1Url: rank1Url || null,
+        rank2Name: rank2Name || null,
+        rank2Url: rank2Url || null,
+        rank3Name: rank3Name || null,
+        rank3Url: rank3Url || null,
+        rank4Name: rank4Name || null,
+        rank4Url: rank4Url || null,
+        rank5Name: rank5Name || null,
+        rank5Url: rank5Url || null,
+        rank6Name: rank6Name || null,
+        rank6Url: rank6Url || null,
+        rank7Name: rank7Name || null,
+        rank7Url: rank7Url || null,
+        rank8Name: rank8Name || null,
+        rank8Url: rank8Url || null,
+        rank9Name: rank9Name || null,
+        rank9Url: rank9Url || null,
+        rank10Name: rank10Name || null,
+        rank10Url: rank10Url || null,
+      },
+    });
+    await mergeJob.getQueryResults();
+    console.log(
+      `✅ [ORG-CB] MERGE completed for job ${jobId} into ${DATASET_ID}.${ORGANIC_JOBS_TABLE_ID}`
+    );
+  } catch (err) {
+    console.error(
+      `❌ [ORG-CB] MERGE FAILED for job ${jobId}:`,
+      JSON.stringify(err.errors || err, null, 2)
+    );
+  }
 }
 
 // ======================================================================
@@ -218,7 +486,6 @@ async function processDemographicsStage(job, locationOverride = null) {
     }, createdAt = ${JSON.stringify(job.createdAt) || 'NULL'}`
   );
 
-  // 🔒 avoid re-processing if already completed
   if (demographicsStatus === 'completed') {
     console.log(
       `ℹ️ [DEMOS] Job ${jobId} demographics already 'completed'; skipping re-processing.`
@@ -333,7 +600,7 @@ async function processDemographicsStage(job, locationOverride = null) {
 
   try {
     const mergeQuery = `
-      MERGE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\` T
+      MERGE \`${PROJECT_ID}.${DATASET_ID}.${DEMO_JOBS_TABLE_ID}\` T
       USING (
         SELECT
           @jobId AS jobId,
@@ -391,7 +658,7 @@ async function processDemographicsStage(job, locationOverride = null) {
     await mergeJob.getQueryResults();
 
     console.log(
-      `✅ [DEMOS] MERGE completed for job ${jobId} into ${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}`
+      `✅ [DEMOS] MERGE completed for job ${jobId} into ${DATASET_ID}.${DEMO_JOBS_TABLE_ID}`
     );
   } catch (err) {
     console.error(
@@ -428,7 +695,7 @@ function getSafeJobDateIso(createdAt) {
   const nowIso = new Date().toISOString();
   if (!createdAt) {
     console.warn(
-      `⚠️ [DEMOS] Job createdAt is NULL/undefined; using now() as date for 1_demographicJobs.`
+      `⚠️ Job createdAt is NULL/undefined; using now() as date.`
     );
     return nowIso;
   }
@@ -441,7 +708,7 @@ function getSafeJobDateIso(createdAt) {
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) {
     console.warn(
-      `⚠️ [DEMOS] Invalid createdAt value "${raw}"; using now() as date for 1_demographicJobs.`
+      `⚠️ Invalid createdAt value "${raw}"; using now() as date.`
     );
     return nowIso;
   }
@@ -528,7 +795,6 @@ async function maybeMarkJobCompleted(jobId) {
       organicSearchStatus: job.organicSearchStatus,
     };
 
-    // REQUIRED SEGMENTS for "job completed"
     const requiredSegments = [
       'demographicsStatus',
       'paidAdsStatus',
@@ -579,7 +845,7 @@ async function overwriteJobsDemographicsRow(jobId, data) {
 
   try {
     const mergeQuery = `
-      MERGE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\` T
+      MERGE \`${PROJECT_ID}.${DATASET_ID}.${DEMO_JOBS_TABLE_ID}\` T
       USING (
         SELECT
           @jobId AS jobId,
