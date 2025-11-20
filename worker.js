@@ -203,6 +203,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
 async function processDemographicsStage(job, locationOverride = null) {
   const jobId = job.jobId;
   const paidAdsStatus = job.paidAdsStatus || null;
+  const demographicsStatus = job.demographicsStatus || null;
   const location = job.location || locationOverride || null;
 
   const jobDateIso = getSafeJobDateIso(job.createdAt);
@@ -216,6 +217,14 @@ async function processDemographicsStage(job, locationOverride = null) {
       JSON.stringify(job.createdAt) || 'NULL'
     }`
   );
+
+  // 🔒 NEW: avoid re-processing if already completed
+  if (demographicsStatus === 'completed') {
+    console.log(
+      `ℹ️ [DEMOS] Job ${jobId} demographics already 'completed'; skipping re-processing.`
+    );
+    return;
+  }
 
   if (!location) {
     console.warn(
@@ -500,7 +509,7 @@ async function markSegmentStatus(jobId, segmentField, status) {
   }
 }
 
-// If all processed segments are completed, mark overall job.status = 'completed'
+// If all required segments are completed, mark overall job.status = 'completed'
 async function maybeMarkJobCompleted(jobId) {
   try {
     const job = await loadJob(jobId);
@@ -509,27 +518,31 @@ async function maybeMarkJobCompleted(jobId) {
       return;
     }
 
-    const rawSegments = {
+    const segmentStatusMap = {
       demographicsStatus: job.demographicsStatus,
       paidAdsStatus: job.paidAdsStatus,
       organicSearchStatus: job.organicSearchStatus,
     };
 
-    const segments = Object.values(rawSegments).filter(
-      (s) => s && s !== 'queued'
+    // 🔒 REQUIRED SEGMENTS for "job completed"
+    const requiredSegments = [
+      'demographicsStatus',
+      'paidAdsStatus',
+      'organicSearchStatus',
+    ];
+
+    const statuses = requiredSegments.map(
+      (key) => segmentStatusMap[key] || 'queued'
     );
 
-    if (!segments.length) {
-      console.log(
-        `ℹ️ maybeMarkJobCompleted: no processed segment statuses yet for job ${jobId}.`
-      );
-      return;
-    }
+    const allDone = statuses.every(
+      (s) => s && s !== 'queued' && s !== 'pending'
+    );
+    const allCompleted = statuses.every((s) => s === 'completed');
 
-    const allCompleted = segments.every((s) => s === 'completed');
-    if (!allCompleted) {
+    if (!allDone || !allCompleted) {
       console.log(
-        `ℹ️ maybeMarkJobCompleted: not all processed segments completed for job ${jobId} (segments=${segments.join(
+        `ℹ️ maybeMarkJobCompleted: job ${jobId} not fully completed yet (required segment statuses=${statuses.join(
           ','
         )}).`
       );
