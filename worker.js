@@ -138,9 +138,9 @@ async function loadJob(jobId) {
         services,
         status,
         createdAt,
-        1_demographics_Status,
-        7_organicSearch_Status,
-        8_paidAds_Status
+        \`1_demographics_Status\`,
+        \`7_organicSearch_Status\`,
+        \`8_paidAds_Status\`
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -268,6 +268,7 @@ async function processDemographics(jobId, locationFromMessage) {
       `⚠️ [DEMOS] Job ${jobId} has no location; cannot process demographics.`
     );
     await markSegmentStatus(jobId, '1_demographics_Status', 'failed');
+    await maybeMarkJobCompleted(jobId);
     return;
   }
 
