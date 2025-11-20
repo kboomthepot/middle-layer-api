@@ -173,7 +173,7 @@ async function processOrganicSearchStage(jobId) {
     console.error(`❌ [ORG] Error calling n8n webhook for job ${jobId}:`, err);
   }
 
-  // Later: when 7_organicSearch_Jobs is filled + callback wired,
+  // later: when 7_organicSearch_Jobs is filled + callback wired,
   // we'll update 7_organicSearch_Status here.
 }
 
@@ -204,21 +204,21 @@ async function processDemographicsStage(job, locationOverride = null) {
   const jobId = job.jobId;
   const paidAdsStatus = job.paidAdsStatus || null;
   const demographicsStatus = job.demographicsStatus || null;
+  const organicSearchStatus = job.organicSearchStatus || null;
   const location = job.location || locationOverride || null;
+  const businessName = job.businessName || null;
 
   const jobDateIso = getSafeJobDateIso(job.createdAt);
 
   console.log(
     `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${
       job.demographicsStatus
-    }, paidAdsStatus = ${paidAdsStatus}, organicSearchStatus = ${
-      job.organicSearchStatus
-    }, status = ${job.status}, createdAt = ${
-      JSON.stringify(job.createdAt) || 'NULL'
-    }`
+    }, paidAdsStatus = ${paidAdsStatus}, organicSearchStatus = ${organicSearchStatus}, status = ${
+      job.status
+    }, createdAt = ${JSON.stringify(job.createdAt) || 'NULL'}`
   );
 
-  // 🔒 NEW: avoid re-processing if already completed
+  // 🔒 avoid re-processing if already completed
   if (demographicsStatus === 'completed') {
     console.log(
       `ℹ️ [DEMOS] Job ${jobId} demographics already 'completed'; skipping re-processing.`
@@ -268,6 +268,7 @@ async function processDemographicsStage(job, locationOverride = null) {
 
     await overwriteJobsDemographicsRow(jobId, {
       jobId,
+      businessName,
       date: jobDateIso,
       population_no: null,
       median_age: null,
@@ -327,7 +328,7 @@ async function processDemographicsStage(job, locationOverride = null) {
       `pop=${parsed.population_no}, age=${parsed.median_age}, households=${parsed.households_no}, ` +
       `income_hh=${parsed.median_income_households}, income_fam=${parsed.median_income_families}, ` +
       `male=${parsed.male_percentage}, female=${parsed.female_percentage}, ` +
-      `status=${newDemoStatus}, date=${jobDateIso}`
+      `status=${newDemoStatus}, date=${jobDateIso}, businessName=${businessName}`
   );
 
   try {
@@ -345,7 +346,7 @@ async function processDemographicsStage(job, locationOverride = null) {
           @female_percentage AS female_percentage,
           @status AS status,
           TIMESTAMP(@date) AS date,
-          CAST(NULL AS STRING) AS businessName
+          @businessName AS businessName
       ) S
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
@@ -358,7 +359,8 @@ async function processDemographicsStage(job, locationOverride = null) {
           male_percentage = S.male_percentage,
           female_percentage = S.female_percentage,
           status = S.status,
-          date = S.date
+          date = S.date,
+          businessName = S.businessName
       WHEN NOT MATCHED THEN
         INSERT (jobId, date, status, businessName,
                 population_no, households_no, median_age,
@@ -383,6 +385,7 @@ async function processDemographicsStage(job, locationOverride = null) {
         female_percentage: parsed.female_percentage,
         status: newDemoStatus,
         date: jobDateIso,
+        businessName,
       },
     });
     await mergeJob.getQueryResults();
@@ -453,6 +456,7 @@ async function loadJob(jobId) {
     query: `
       SELECT
         jobId,
+        businessName,
         location,
         services,
         \`1_demographics_Status\` AS demographicsStatus,
@@ -524,7 +528,7 @@ async function maybeMarkJobCompleted(jobId) {
       organicSearchStatus: job.organicSearchStatus,
     };
 
-    // 🔒 REQUIRED SEGMENTS for "job completed"
+    // REQUIRED SEGMENTS for "job completed"
     const requiredSegments = [
       'demographicsStatus',
       'paidAdsStatus',
@@ -571,6 +575,7 @@ async function maybeMarkJobCompleted(jobId) {
 
 async function overwriteJobsDemographicsRow(jobId, data) {
   const rowDateIso = data.date || new Date().toISOString();
+  const businessName = data.businessName || null;
 
   try {
     const mergeQuery = `
@@ -587,7 +592,7 @@ async function overwriteJobsDemographicsRow(jobId, data) {
           @female_percentage AS female_percentage,
           @status AS status,
           TIMESTAMP(@date) AS date,
-          CAST(NULL AS STRING) AS businessName
+          @businessName AS businessName
       ) S
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
@@ -600,7 +605,8 @@ async function overwriteJobsDemographicsRow(jobId, data) {
           male_percentage = S.male_percentage,
           female_percentage = S.female_percentage,
           status = S.status,
-          date = S.date
+          date = S.date,
+          businessName = S.businessName
       WHEN NOT MATCHED THEN
         INSERT (jobId, date, status, businessName,
                 population_no, households_no, median_age,
@@ -625,6 +631,7 @@ async function overwriteJobsDemographicsRow(jobId, data) {
         female_percentage: data.female_percentage ?? null,
         status: data.status || 'failed',
         date: rowDateIso,
+        businessName,
       },
     });
     await mergeJob.getQueryResults();
