@@ -113,7 +113,7 @@ app.post('/organic-result', async (req, res) => {
       `▶️ [ORG-CB] Processing organic callback for job ${jobId} (location=${job.location}, services=${job.services})`
     );
 
-    await upsertOrganicResults(jobId, job.location || null, item);
+    await upsertOrganicResults(jobId, item);
 
     await markSegmentStatus(jobId, '7_organicSearch_Status', 'completed');
 
@@ -305,7 +305,6 @@ async function processDemographics(jobId, locationFromMessage) {
 
     await upsertDemographicsJobRow(jobId, {
       jobId,
-      location,
       date: jobDateIso,
       population_no: null,
       median_age: null,
@@ -372,9 +371,8 @@ async function processDemographics(jobId, locationFromMessage) {
   await upsertDemographicsJobRow(jobId, {
     ...parsed,
     jobId,
-    location,
-    status: newDemoStatus,
     date: jobDateIso,
+    status: newDemoStatus,
     businessName: job.businessName || null
   });
 
@@ -392,7 +390,6 @@ async function upsertDemographicsJobRow(jobId, data) {
 
   const params = {
     jobId,
-    location: data.location || null,
     population_no: data.population_no,
     median_age: data.median_age,
     households_no: data.households_no,
@@ -412,7 +409,6 @@ async function upsertDemographicsJobRow(jobId, data) {
     USING (
       SELECT
         @jobId AS jobId,
-        @location AS location,
         @population_no AS population_no,
         @median_age AS median_age,
         @households_no AS households_no,
@@ -429,7 +425,6 @@ async function upsertDemographicsJobRow(jobId, data) {
     ON T.jobId = S.jobId
     WHEN MATCHED THEN
       UPDATE SET
-        T.location = S.location,
         T.population_no = S.population_no,
         T.median_age = S.median_age,
         T.households_no = S.households_no,
@@ -444,7 +439,6 @@ async function upsertDemographicsJobRow(jobId, data) {
     WHEN NOT MATCHED THEN
       INSERT (
         jobId,
-        location,
         population_no,
         median_age,
         households_no,
@@ -460,7 +454,6 @@ async function upsertDemographicsJobRow(jobId, data) {
       )
       VALUES (
         S.jobId,
-        S.location,
         S.population_no,
         S.median_age,
         S.households_no,
@@ -568,13 +561,11 @@ async function processOrganic(jobId, locationFromMessage) {
   }
 }
 
-async function upsertOrganicResults(jobId, location, item) {
+async function upsertOrganicResults(jobId, item) {
   const nowIso = new Date().toISOString();
 
   const params = {
     jobId,
-    location: location || null,
-    services: item.services || null,
     rank1Name: item.rank1Name || null,
     rank1Url: item.rank1Url || null,
     rank2Name: item.rank2Name || null,
@@ -605,8 +596,6 @@ async function upsertOrganicResults(jobId, location, item) {
     USING (
       SELECT
         @jobId AS jobId,
-        @location AS location,
-        @services AS services,
         @rank1Name AS rank1Name,
         @rank1Url AS rank1Url,
         @rank2Name AS rank2Name,
@@ -634,8 +623,6 @@ async function upsertOrganicResults(jobId, location, item) {
     ON T.jobId = S.jobId
     WHEN MATCHED THEN
       UPDATE SET
-        T.location = S.location,
-        T.services = S.services,
         T.rank1Name = S.rank1Name,
         T.rank1Url = S.rank1Url,
         T.rank2Name = S.rank2Name,
@@ -661,8 +648,6 @@ async function upsertOrganicResults(jobId, location, item) {
     WHEN NOT MATCHED THEN
       INSERT (
         jobId,
-        location,
-        services,
         rank1Name,
         rank1Url,
         rank2Name,
@@ -689,8 +674,6 @@ async function upsertOrganicResults(jobId, location, item) {
       )
       VALUES (
         S.jobId,
-        S.location,
-        S.services,
         S.rank1Name,
         S.rank1Url,
         S.rank2Name,
@@ -728,8 +711,9 @@ async function upsertOrganicResults(jobId, location, item) {
     );
   } catch (err) {
     console.error(
-      `❌ [ORG-CB] MERGE FAILED for job ${jobId}:`,
-      JSON.stringify(err.errors || err, null, 2)
+      `❌ [ORG-CB] MERGE FAILED for job ${jobId}: message=${err.message}`,
+      'errors=', err.errors,
+      'fullError=', err
     );
   }
 }
