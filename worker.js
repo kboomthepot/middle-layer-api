@@ -102,13 +102,11 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const paidAdsStatus = job.paidAdsStatus || null;
   const location = job.location || locationFromMessage || null;
 
-  // Normalize createdAt from jobs table (will be stored as "date" in jobs_demographics)
-  const jobCreatedAtIso = job.createdAt
-    ? new Date(job.createdAt).toISOString()
-    : null;
+  // Safely derive the "date" we want to store in jobs_demographics
+  const jobDateIso = getSafeJobDateIso(job.createdAt);
 
   console.log(
-    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt=${jobCreatedAtIso}`
+    `ℹ️ [DEMOS] Job ${jobId} location = "${location}", demographicsStatus = ${job.demographicsStatus}, paidAdsStatus = ${paidAdsStatus}, status = ${job.status}, createdAt = ${job.createdAt || 'NULL'}`
   );
 
   if (!location) {
@@ -180,6 +178,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     await overwriteJobsDemographicsRow(jobId, {
       jobId,
       location,
+      date: jobDateIso,
       population_no: null,
       median_age: null,
       median_income_households: null,
@@ -187,8 +186,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       male_percentage: null,
       female_percentage: null,
       status: 'failed',
-      // date will be filled from jobCreatedAtIso inside helper
-    }, jobCreatedAtIso);
+    });
 
     await markJobDemographicsStatus(jobId, 'failed');
     return;
@@ -232,11 +230,13 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   else if (allNonNull) newDemoStatus = 'completed';
   else newDemoStatus = 'partial';
 
-  // Cleaner Step 4 log – just the parsed values
+  // Clean, human-readable summary instead of giant Big objects
   console.log(
-    `ℹ️ [DEMOS] Step 4 metrics for job ${jobId}:`,
-    parsed,
-    `=> newDemoStatus="${newDemoStatus}"`
+    `ℹ️ [DEMOS] Step 4 storing demographics for job ${jobId}: ` +
+      `pop=${parsed.population_no}, age=${parsed.median_age}, ` +
+      `income_hh=${parsed.median_income_households}, income_fam=${parsed.median_income_families}, ` +
+      `male=${parsed.male_percentage}, female=${parsed.female_percentage}, ` +
+      `status=${newDemoStatus}, date=${jobDateIso}`
   );
 
   // Delete any existing row for this jobId (safe DML – doesn't touch streaming rows)
@@ -272,16 +272,10 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     male_percentage: parsed.male_percentage,
     female_percentage: parsed.female_percentage,
     status: newDemoStatus,
-    // 👇 store original job createdAt from client_audits_jobs into "date"
-    date: jobCreatedAtIso,
-    createdAt: nowIso,
+    date: jobDateIso,        // <- date from client_audits_jobs.createdAt
+    createdAt: nowIso,       // worker insert time
     updatedAt: nowIso,
   };
-
-  console.log(
-    `ℹ️ [DEMOS] Step 4 rowToInsert for job ${jobId}:`,
-    rowToInsert
-  );
 
   try {
     await bigquery
@@ -303,59 +297,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     return;
   }
 
-  // Optional: one quick verification attempt (SELECT reads streaming buffer)
-  try {
-    const [checkRows] = await bigquery.query({
-      query: `
-        SELECT
-          jobId,
-          location,
-          population_no,
-          median_age,
-          median_income_households,
-          median_income_families,
-          male_percentage,
-          female_percentage,
-          status,
-          date
-        FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-        WHERE jobId = @jobId
-        LIMIT 1
-      `,
-      params: { jobId },
-    });
-
-    const r = checkRows[0] || null;
-
-    // 👇 Cleaned-up log: convert Big values to string/number and show only useful fields
-    if (r) {
-      console.log(
-        `ℹ️ [DEMOS] Step 4 check row for job ${jobId}:`,
-        {
-          jobId: r.jobId,
-          location: r.location,
-          population_no: r.population_no?.toString?.() ?? r.population_no,
-          median_age: r.median_age?.toString?.() ?? r.median_age,
-          median_income_households:
-            r.median_income_households?.toString?.() ?? r.median_income_households,
-          median_income_families:
-            r.median_income_families?.toString?.() ?? r.median_income_families,
-          male_percentage: r.male_percentage?.toString?.() ?? r.male_percentage,
-          female_percentage:
-            r.female_percentage?.toString?.() ?? r.female_percentage,
-          status: r.status,
-          date: r.date,
-        }
-      );
-    } else {
-      console.log(`ℹ️ [DEMOS] Step 4 check row for job ${jobId}: null`);
-    }
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error verifying jobs_demographics row for job ${jobId}:`,
-      err
-    );
-  }
+  // (Removed noisy "Step 4 check row" Big-object log)
 
   // ---- Step 5: Update main job's demographicsStatus based on newDemoStatus ----
   console.log('➡️ [DEMOS] Step 5: Update client_audits_jobs.demographicsStatus');
@@ -403,6 +345,24 @@ function toNumberOrNull(value) {
   return n;
 }
 
+function getSafeJobDateIso(createdAt) {
+  const nowIso = new Date().toISOString();
+  if (!createdAt) {
+    console.warn(
+      `⚠️ [DEMOS] Job createdAt is NULL/undefined; using now() as date for jobs_demographics.`
+    );
+    return nowIso;
+  }
+  const d = new Date(createdAt);
+  if (Number.isNaN(d.getTime())) {
+    console.warn(
+      `⚠️ [DEMOS] Invalid createdAt value "${createdAt}"; using now() as date for jobs_demographics.`
+    );
+    return nowIso;
+  }
+  return d.toISOString();
+}
+
 async function markJobDemographicsStatus(jobId, demoStatus) {
   // demoStatus is expected: 'pending' | 'completed' | 'partial' | 'failed'
   try {
@@ -426,7 +386,7 @@ async function markJobDemographicsStatus(jobId, demoStatus) {
   }
 }
 
-async function overwriteJobsDemographicsRow(jobId, data, jobCreatedAtIso = null) {
+async function overwriteJobsDemographicsRow(jobId, data) {
   // Convenience for "no data" case
   const nowIso = new Date().toISOString();
   const row = {
@@ -439,8 +399,7 @@ async function overwriteJobsDemographicsRow(jobId, data, jobCreatedAtIso = null)
     male_percentage: data.male_percentage ?? null,
     female_percentage: data.female_percentage ?? null,
     status: data.status || 'failed',
-    // 👇 keep date aligned with client_audits_jobs.createdAt
-    date: jobCreatedAtIso,
+    date: data.date || nowIso, // use provided job date or now
     createdAt: nowIso,
     updatedAt: nowIso,
   };
