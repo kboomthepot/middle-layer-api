@@ -181,6 +181,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
       date: jobDateIso,
       population_no: null,
       median_age: null,
+      households_no: null,
       median_income_households: null,
       median_income_families: null,
       male_percentage: null,
@@ -207,6 +208,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const parsed = {
     population_no: toNumberOrNull(demo.population_no),
     median_age: toNumberOrNull(demo.median_age),
+    households_no: toNumberOrNull(demo.households_no),
     median_income_households: toNumberOrNull(demo.median_income_households),
     median_income_families: toNumberOrNull(demo.median_income_families),
     male_percentage: toNumberOrNull(demo.male_percentage),
@@ -216,6 +218,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   const metricsArray = [
     parsed.population_no,
     parsed.median_age,
+    parsed.households_no,
     parsed.median_income_households,
     parsed.median_income_families,
     parsed.male_percentage,
@@ -233,7 +236,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
   // Clean, human-readable summary instead of giant Big objects
   console.log(
     `ℹ️ [DEMOS] Step 4 storing demographics for job ${jobId}: ` +
-      `pop=${parsed.population_no}, age=${parsed.median_age}, ` +
+      `pop=${parsed.population_no}, age=${parsed.median_age}, households=${parsed.households_no}, ` +
       `income_hh=${parsed.median_income_households}, income_fam=${parsed.median_income_families}, ` +
       `male=${parsed.male_percentage}, female=${parsed.female_percentage}, ` +
       `status=${newDemoStatus}, date=${jobDateIso}`
@@ -267,6 +270,7 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     location,
     population_no: parsed.population_no,
     median_age: parsed.median_age,
+    households_no: parsed.households_no,
     median_income_households: parsed.median_income_households,
     median_income_families: parsed.median_income_families,
     male_percentage: parsed.male_percentage,
@@ -296,8 +300,6 @@ async function processJobDemographics(jobId, locationFromMessage = null) {
     await markJobDemographicsStatus(jobId, 'failed');
     return;
   }
-
-  // (Removed noisy "Step 4 check row" Big-object log)
 
   // ---- Step 5: Update main job's demographicsStatus based on newDemoStatus ----
   console.log('➡️ [DEMOS] Step 5: Update client_audits_jobs.demographicsStatus');
@@ -394,6 +396,7 @@ async function overwriteJobsDemographicsRow(jobId, data) {
     location: data.location || null,
     population_no: data.population_no ?? null,
     median_age: data.median_age ?? null,
+    households_no: data.households_no ?? null,
     median_income_households: data.median_income_households ?? null,
     median_income_families: data.median_income_families ?? null,
     male_percentage: data.male_percentage ?? null,
