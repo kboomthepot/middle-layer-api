@@ -53,9 +53,6 @@ app.post('/jobs', async (req, res) => {
 
   const createdAt = new Date().toISOString();
 
-  // For now, we only kick off the demographics stage.
-  const stage = 'demographics';
-
   const row = {
     jobId,
 
@@ -125,8 +122,9 @@ app.post('/jobs', async (req, res) => {
 
     console.log(`✅ Job inserted successfully (DML): ${jobId}`);
 
-    // publish event to worker (now with stage)
-    await publishJobEvent({ jobId, location, createdAt, stage });
+    // publish events to worker: demographics AND 7_organicSearch
+    await publishJobEvent({ jobId, location, createdAt, stage: 'demographics' });
+    await publishJobEvent({ jobId, location, createdAt, stage: '7_organicSearch' });
 
     res.json({
       jobId,

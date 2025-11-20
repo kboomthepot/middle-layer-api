@@ -93,11 +93,6 @@ async function handleJobMessage({ jobId, locationFromMessage, stage }) {
         await processOrganicSearchStage(jobId);
         break;
 
-      // 🔜 future:
-      // case 'paidAds':
-      //   await processPaidAdsStage(jobId);
-      //   break;
-
       default:
         console.warn(
           `⚠️ Unknown stage "${stage}" for job ${jobId}. Skipping processing.`
@@ -118,7 +113,6 @@ async function handleJobMessage({ jobId, locationFromMessage, stage }) {
 async function processJobDemographics(jobId, locationFromMessage = null) {
   console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
 
-  // Load job using shared helper
   const job = await loadJob(jobId);
 
   if (!job) {
@@ -151,7 +145,6 @@ async function processOrganicSearchStage(jobId) {
   let servicesArray = [];
   if (job.services) {
     try {
-      // services is stored as JSON string in jobs table
       servicesArray = JSON.parse(job.services);
       if (!Array.isArray(servicesArray)) {
         servicesArray = [servicesArray];
@@ -177,7 +170,6 @@ async function processOrganicSearchStage(jobId) {
   );
 
   try {
-    // Node 18+ has global fetch available
     const response = await fetch(ORGANIC_WEBHOOK_URL, {
       method: 'POST',
       headers: {
@@ -203,10 +195,8 @@ async function processOrganicSearchStage(jobId) {
     console.error(`❌ [ORG] Error calling n8n webhook for job ${jobId}:`, err);
   }
 
-  // NOTE (for now):
-  // - We are NOT updating 7_organicSearchStatus yet.
-  // - It stays 'queued' until we add a callback from n8n that
-  //   marks it 'completed' or 'failed'.
+  // Later: when 7_organicJobs is written + callback is wired,
+  // we'll mark 7_organicSearchStatus here.
 }
 
 // ======================================================================
@@ -218,7 +208,6 @@ async function processDemographicsStage(job, locationOverride = null) {
   const paidAdsStatus = job.paidAdsStatus || null;
   const location = job.location || locationOverride || null;
 
-  // Safely derive the "date" we want to store in jobs_demographics
   const jobDateIso = getSafeJobDateIso(job.createdAt);
 
   console.log(
@@ -227,7 +216,7 @@ async function processDemographicsStage(job, locationOverride = null) {
     }, paidAdsStatus = ${paidAdsStatus}, organicSearchStatus = ${
       job.organicSearchStatus
     }, status = ${job.status}, createdAt = ${
-      job.createdAt || 'NULL'
+      JSON.stringify(job.createdAt) || 'NULL'
     }`
   );
 
@@ -236,17 +225,13 @@ async function processDemographicsStage(job, locationOverride = null) {
       `⚠️ [DEMOS] Job ${jobId} has no location; cannot process demographics.`
     );
 
-    // Mark main job as failed for demographics
     await markSegmentStatus(jobId, 'demographicsStatus', 'failed');
     return;
   }
 
-  // ---- Step 2: Mark main job demographicsStatus = pending ----
   console.log('➡️ [DEMOS] Step 2: Mark main job demographicsStatus = pending');
-
   await markSegmentStatus(jobId, 'demographicsStatus', 'pending');
 
-  // ---- Step 3: Load demographics source row ----
   console.log(
     '➡️ [DEMOS] Step 3: Load demographics from Client_audits_data.1_demographics'
   );
@@ -275,7 +260,6 @@ async function processDemographicsStage(job, locationOverride = null) {
       `⚠️ [DEMOS] No demographics found in ${DEMOS_DATASET_ID}.${DEMOS_SOURCE_TABLE_ID} for location "${location}". Marking as failed.`
     );
 
-    // Delete any existing row, then insert a "failed" row with nulls
     await overwriteJobsDemographicsRow(jobId, {
       jobId,
       location,
@@ -301,9 +285,8 @@ async function processDemographicsStage(job, locationOverride = null) {
       JSON.stringify(demo)
   );
 
-  // ---- Step 4: Compute metrics + status; overwrite jobs_demographics row via streaming insert ----
   console.log(
-    '➡️ [DEMOS] Step 4: Overwrite jobs_demographics with demographics values via streaming insert'
+    '➡️ [DEMOS] Step 4: MERGE into jobs_demographics with demographics values'
   );
 
   const parsed = {
@@ -334,7 +317,6 @@ async function processDemographicsStage(job, locationOverride = null) {
   else if (allNonNull) newDemoStatus = 'completed';
   else newDemoStatus = 'partial';
 
-  // Clean, human-readable summary instead of giant Big objects
   console.log(
     `ℹ️ [DEMOS] Step 4 storing demographics for job ${jobId}: ` +
       `pop=${parsed.population_no}, age=${parsed.median_age}, households=${parsed.households_no}, ` +
@@ -343,71 +325,87 @@ async function processDemographicsStage(job, locationOverride = null) {
       `status=${newDemoStatus}, date=${jobDateIso}`
   );
 
-  // Delete any existing row for this jobId (safe DML – doesn't touch streaming rows)
-  try {
-    const [deleteJob] = await bigquery.createQueryJob({
-      query: `
-        DELETE FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-        WHERE jobId = @jobId
-      `,
-      params: { jobId },
-    });
-    await deleteJob.getQueryResults();
-    console.log(
-      `ℹ️ [DEMOS] Step 4: Deleted any existing jobs_demographics row for job ${jobId} before streaming insert.`
-    );
-  } catch (err) {
-    console.error(
-      `❌ [DEMOS] Error deleting existing jobs_demographics row for job ${jobId}:`,
-      err
-    );
-    // continue anyway; insert will just create a fresh row
-  }
-
-  // Streaming insert full row with metrics + status
   const nowIso = new Date().toISOString();
-  const rowToInsert = {
-    jobId,
-    location,
-    population_no: parsed.population_no,
-    median_age: parsed.median_age,
-    households_no: parsed.households_no,
-    median_income_households: parsed.median_income_households,
-    median_income_families: parsed.median_income_families,
-    male_percentage: parsed.male_percentage,
-    female_percentage: parsed.female_percentage,
-    status: newDemoStatus,
-    date: jobDateIso,        // <- date from client_audits_jobs.createdAt
-    createdAt: nowIso,       // worker insert time
-    updatedAt: nowIso,
-  };
 
   try {
-    await bigquery
-      .dataset(DATASET_ID)
-      .table(JOBS_DEMOS_TABLE_ID)
-      .insert([rowToInsert], { ignoreUnknownValues: true });
+    const mergeQuery = `
+      MERGE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\` T
+      USING (
+        SELECT
+          @jobId AS jobId,
+          @location AS location,
+          @population_no AS population_no,
+          @median_age AS median_age,
+          @households_no AS households_no,
+          @median_income_households AS median_income_households,
+          @median_income_families AS median_income_families,
+          @male_percentage AS male_percentage,
+          @female_percentage AS female_percentage,
+          @status AS status,
+          @date AS date,
+          @createdAt AS createdAt,
+          @updatedAt AS updatedAt
+      ) S
+      ON T.jobId = S.jobId
+      WHEN MATCHED THEN
+        UPDATE SET
+          location = S.location,
+          population_no = S.population_no,
+          median_age = S.median_age,
+          households_no = S.households_no,
+          median_income_households = S.median_income_households,
+          median_income_families = S.median_income_families,
+          male_percentage = S.male_percentage,
+          female_percentage = S.female_percentage,
+          status = S.status,
+          date = S.date,
+          createdAt = S.createdAt,
+          updatedAt = S.updatedAt
+      WHEN NOT MATCHED THEN
+        INSERT (jobId, location, population_no, median_age, households_no,
+                median_income_households, median_income_families,
+                male_percentage, female_percentage, status, date, createdAt, updatedAt)
+        VALUES (S.jobId, S.location, S.population_no, S.median_age, S.households_no,
+                S.median_income_households, S.median_income_families,
+                S.male_percentage, S.female_percentage, S.status, S.date, S.createdAt, S.updatedAt)
+    `;
+
+    const [mergeJob] = await bigquery.createQueryJob({
+      query: mergeQuery,
+      params: {
+        jobId,
+        location,
+        population_no: parsed.population_no,
+        median_age: parsed.median_age,
+        households_no: parsed.households_no,
+        median_income_households: parsed.median_income_households,
+        median_income_families: parsed.median_income_families,
+        male_percentage: parsed.male_percentage,
+        female_percentage: parsed.female_percentage,
+        status: newDemoStatus,
+        date: jobDateIso,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      },
+    });
+    await mergeJob.getQueryResults();
 
     console.log(
-      `✅ [DEMOS] Streaming insert completed for job ${jobId} into ${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}`
+      `✅ [DEMOS] MERGE completed for job ${jobId} into ${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}`
     );
   } catch (err) {
     console.error(
-      `❌ [DEMOS] Streaming insert FAILED for job ${jobId} into jobs_demographics:`,
+      `❌ [DEMOS] MERGE FAILED for job ${jobId} into jobs_demographics:`,
       JSON.stringify(err.errors || err, null, 2)
     );
 
-    // If insert fails, mark main job as failed
     await markSegmentStatus(jobId, 'demographicsStatus', 'failed');
     return;
   }
 
-  // ---- Step 5: Update main job's demographicsStatus based on newDemoStatus ----
   console.log('➡️ [DEMOS] Step 5: Update client_audits_jobs.demographicsStatus');
-
   await markSegmentStatus(jobId, 'demographicsStatus', newDemoStatus);
 
-  // ---- Step 6: Optionally update main job.status if all segments done ----
   console.log(
     '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
   );
@@ -434,10 +432,16 @@ function getSafeJobDateIso(createdAt) {
     );
     return nowIso;
   }
-  const d = new Date(createdAt);
+
+  let raw = createdAt;
+  if (typeof createdAt === 'object' && createdAt.value) {
+    raw = createdAt.value;
+  }
+
+  const d = new Date(raw);
   if (Number.isNaN(d.getTime())) {
     console.warn(
-      `⚠️ [DEMOS] Invalid createdAt value "${createdAt}"; using now() as date for jobs_demographics.`
+      `⚠️ [DEMOS] Invalid createdAt value "${raw}"; using now() as date for jobs_demographics.`
     );
     return nowIso;
   }
@@ -473,8 +477,6 @@ async function loadJob(jobId) {
 
 // Mark any segment status on the main jobs table
 async function markSegmentStatus(jobId, segmentField, status) {
-  // segmentField is one of our logical keys:
-  // 'demographicsStatus' | 'paidAdsStatus' | 'organicSearchStatus'
   const fieldMap = {
     demographicsStatus: 'demographicsStatus',
     paidAdsStatus: 'paidAdsStatus',
@@ -521,13 +523,10 @@ async function maybeMarkJobCompleted(jobId) {
       return;
     }
 
-    // Only consider segments that have actually been processed
-    // (i.e. not 'queued' and not null)
     const rawSegments = {
       demographicsStatus: job.demographicsStatus,
       paidAdsStatus: job.paidAdsStatus,
       organicSearchStatus: job.organicSearchStatus,
-      // later: seoStatus, etc.
     };
 
     const segments = Object.values(rawSegments).filter(
@@ -572,7 +571,6 @@ async function maybeMarkJobCompleted(jobId) {
 }
 
 async function overwriteJobsDemographicsRow(jobId, data) {
-  // Convenience for "no data" case or full overwrite
   const nowIso = new Date().toISOString();
   const row = {
     jobId: data.jobId,
@@ -585,41 +583,80 @@ async function overwriteJobsDemographicsRow(jobId, data) {
     male_percentage: data.male_percentage ?? null,
     female_percentage: data.female_percentage ?? null,
     status: data.status || 'failed',
-    date: data.date || nowIso, // use provided job date or now
+    date: data.date || nowIso,
     createdAt: nowIso,
     updatedAt: nowIso,
   };
 
   try {
-    const [deleteJob] = await bigquery.createQueryJob({
-      query: `
-        DELETE FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\`
-        WHERE jobId = @jobId
-      `,
-      params: { jobId },
-    });
-    await deleteJob.getQueryResults();
-    console.log(
-      `ℹ️ overwriteJobsDemographicsRow: deleted existing row(s) for job ${jobId}`
-    );
-  } catch (err) {
-    console.error(
-      `❌ overwriteJobsDemographicsRow: error deleting existing rows for job ${jobId}:`,
-      err
-    );
-  }
+    const mergeQuery = `
+      MERGE \`${PROJECT_ID}.${DATASET_ID}.${JOBS_DEMOS_TABLE_ID}\` T
+      USING (
+        SELECT
+          @jobId AS jobId,
+          @location AS location,
+          @population_no AS population_no,
+          @median_age AS median_age,
+          @households_no AS households_no,
+          @median_income_households AS median_income_households,
+          @median_income_families AS median_income_families,
+          @male_percentage AS male_percentage,
+          @female_percentage AS female_percentage,
+          @status AS status,
+          @date AS date,
+          @createdAt AS createdAt,
+          @updatedAt AS updatedAt
+      ) S
+      ON T.jobId = S.jobId
+      WHEN MATCHED THEN
+        UPDATE SET
+          location = S.location,
+          population_no = S.population_no,
+          median_age = S.median_age,
+          households_no = S.households_no,
+          median_income_households = S.median_income_households,
+          median_income_families = S.median_income_families,
+          male_percentage = S.male_percentage,
+          female_percentage = S.female_percentage,
+          status = S.status,
+          date = S.date,
+          createdAt = S.createdAt,
+          updatedAt = S.updatedAt
+      WHEN NOT MATCHED THEN
+        INSERT (jobId, location, population_no, median_age, households_no,
+                median_income_households, median_income_families,
+                male_percentage, female_percentage, status, date, createdAt, updatedAt)
+        VALUES (S.jobId, S.location, S.population_no, S.median_age, S.households_no,
+                S.median_income_households, S.median_income_families,
+                S.male_percentage, S.female_percentage, S.status, S.date, S.createdAt, S.updatedAt)
+    `;
 
-  try {
-    await bigquery
-      .dataset(DATASET_ID)
-      .table(JOBS_DEMOS_TABLE_ID)
-      .insert([row], { ignoreUnknownValues: true });
+    const [mergeJob] = await bigquery.createQueryJob({
+      query: mergeQuery,
+      params: {
+        jobId: row.jobId,
+        location: row.location,
+        population_no: row.population_no,
+        median_age: row.median_age,
+        households_no: row.households_no,
+        median_income_households: row.median_income_households,
+        median_income_families: row.median_income_families,
+        male_percentage: row.male_percentage,
+        female_percentage: row.female_percentage,
+        status: row.status,
+        date: row.date,
+        createdAt: row.createdAt,
+        updatedAt: row.updatedAt,
+      },
+    });
+    await mergeJob.getQueryResults();
+
     console.log(
-      `✅ overwriteJobsDemographicsRow: inserted row for job ${jobId} with status=${row.status}`
+      `✅ overwriteJobsDemographicsRow: MERGE row for job ${jobId} with status=${row.status}`
     );
   } catch (err) {
     console.error(
-      `❌ overwriteJobsDemographicsRow: streaming insert failed for job ${jobId}:`,
+      `❌ overwriteJobsDemographicsRow: MERGE failed for job ${jobId}:`,
       JSON.stringify(err.errors || err, null, 2)
     );
   }
