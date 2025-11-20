@@ -34,8 +34,7 @@ async function publishJobEvent(payload) {
 
   const messageId = await topic.publishMessage({ data: dataBuffer });
   console.log(
-    `📨 Published job ${payload.jobId} (stage=${payload.stage || 'N/A'}) `
-    + `to Pub/Sub topic "${JOB_EVENTS_TOPIC}" with messageId=${messageId}`
+    `📨 Published job ${payload.jobId} (stage=${payload.stage}) to Pub/Sub topic "${JOB_EVENTS_TOPIC}" with messageId=${messageId}`
   );
 }
 
@@ -52,86 +51,144 @@ app.post('/jobs', async (req, res) => {
   } = req.body;
 
   const createdAt = new Date().toISOString();
+  const initialStatus = 'queued';
 
+  // Prepare values (note: we store services as JSON string)
   const row = {
     jobId,
-
-    // user fields
     firstName: user.firstName || null,
     lastName: user.lastName || null,
     email: user.email || null,
     phone: user.phone || null,
-
-    // business fields
     businessName: business.name || null,
     website: business.website || null,
-
-    // job context
     services: JSON.stringify(services || []),
     revenue,
     budget,
     location,
+    status: initialStatus,
 
-    // overall job status
-    status: 'queued',
-
-    // section statuses
-    demographicsStatus: 'queued',
-    paidAdsStatus: 'queued',
-    organicSearchStatus: 'queued', // maps to BigQuery column `7_organicSearchStatus`
+    // Segment statuses (1–10)
+    s1: initialStatus,  // 1_demographics_Status
+    s2: initialStatus,  // 2_industryStats_Status
+    s3: initialStatus,  // 3_leadChannelRanking_Status
+    s4: initialStatus,  // 4_marketStats_Status
+    s5: initialStatus,  // 5_keywords_Status
+    s6: initialStatus,  // 6_seasonality_Status
+    s7: initialStatus,  // 7_organicSearch_Status
+    s8: initialStatus,  // 8_paidAds_Status
+    s9: initialStatus,  // 9_clientInput_Status
+    s10: initialStatus, // 10_summary_Status
 
     createdAt,
   };
 
   try {
-    // DML INSERT to avoid streaming buffer
     const insertQuery = `
       INSERT \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
-        (jobId, firstName, lastName, email, phone,
-         businessName, website, services,
-         revenue, budget, location,
-         status, demographicsStatus, paidAdsStatus, \`7_organicSearchStatus\`, createdAt)
+        (jobId,
+         createdAt,
+         status,
+         businessName,
+         firstName,
+         lastName,
+         email,
+         phone,
+         website,
+         services,
+         revenue,
+         budget,
+         location,
+         \`1_demographics_Status\`,
+         \`2_industryStats_Status\`,
+         \`3_leadChannelRanking_Status\`,
+         \`4_marketStats_Status\`,
+         \`5_keywords_Status\`,
+         \`6_seasonality_Status\`,
+         \`7_organicSearch_Status\`,
+         \`8_paidAds_Status\`,
+         \`9_clientInput_Status\`,
+         \`10_summary_Status\`
+        )
       VALUES
-        (@jobId, @firstName, @lastName, @email, @phone,
-         @businessName, @website, @services,
-         @revenue, @budget, @location,
-         @status, @demographicsStatus, @paidAdsStatus, @organicSearchStatus, @createdAt)
+        (@jobId,
+         @createdAt,
+         @status,
+         @businessName,
+         @firstName,
+         @lastName,
+         @email,
+         @phone,
+         @website,
+         @services,
+         @revenue,
+         @budget,
+         @location,
+         @s1,
+         @s2,
+         @s3,
+         @s4,
+         @s5,
+         @s6,
+         @s7,
+         @s8,
+         @s9,
+         @s10
+        )
     `;
 
     await bigquery.query({
       query: insertQuery,
       params: {
-        jobId,
+        jobId: row.jobId,
+        createdAt: row.createdAt,
+        status: row.status,
+        businessName: row.businessName,
         firstName: row.firstName,
         lastName: row.lastName,
         email: row.email,
         phone: row.phone,
-        businessName: row.businessName,
         website: row.website,
         services: row.services,
         revenue: row.revenue,
         budget: row.budget,
         location: row.location,
-        status: row.status,
-        demographicsStatus: row.demographicsStatus,
-        paidAdsStatus: row.paidAdsStatus,
-        organicSearchStatus: row.organicSearchStatus,
-        createdAt: row.createdAt,
+        s1: row.s1,
+        s2: row.s2,
+        s3: row.s3,
+        s4: row.s4,
+        s5: row.s5,
+        s6: row.s6,
+        s7: row.s7,
+        s8: row.s8,
+        s9: row.s9,
+        s10: row.s10,
       },
     });
 
     console.log(`✅ Job inserted successfully (DML): ${jobId}`);
 
-    // publish events to worker: demographics AND 7_organicSearch
-    await publishJobEvent({ jobId, location, createdAt, stage: 'demographics' });
-    await publishJobEvent({ jobId, location, createdAt, stage: '7_organicSearch' });
+    // publish events to worker for multiple stages
+    await publishJobEvent({
+      jobId,
+      location,
+      createdAt,
+      stage: 'demographics',
+    });
+
+    await publishJobEvent({
+      jobId,
+      location,
+      createdAt,
+      stage: '7_organicSearch',
+    });
 
     res.json({
       jobId,
-      status: 'queued',
-      demographicsStatus: 'queued',
-      paidAdsStatus: 'queued',
-      organicSearchStatus: 'queued',
+      status: row.status,
+      '1_demographics_Status': row.s1,
+      '7_organicSearch_Status': row.s7,
+      '8_paidAds_Status': row.s8,
     });
   } catch (err) {
     console.error('❌ BigQuery Insert Error (DML):', err);
@@ -149,9 +206,9 @@ app.get('/status', async (req, res) => {
     query: `
       SELECT
         status,
-        demographicsStatus,
-        paidAdsStatus,
-        \`7_organicSearchStatus\` AS organicSearchStatus
+        \`1_demographics_Status\` AS demographicsStatus,
+        \`7_organicSearch_Status\` AS organicSearchStatus,
+        \`8_paidAds_Status\` AS paidAdsStatus
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
       WHERE jobId = @jobId
       LIMIT 1
@@ -168,8 +225,8 @@ app.get('/status', async (req, res) => {
       jobId,
       status: row.status,
       demographicsStatus: row.demographicsStatus,
-      paidAdsStatus: row.paidAdsStatus,
       organicSearchStatus: row.organicSearchStatus,
+      paidAdsStatus: row.paidAdsStatus,
     });
   } catch (err) {
     console.error('Failed to fetch job status:', err);

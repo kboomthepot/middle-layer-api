@@ -10,12 +10,12 @@ const PROJECT_ID = 'ghs-construction-1734441714520';
 const DATASET_ID = 'Client_audits';
 const JOBS_TABLE_ID = 'client_audits_jobs';
 
-// Demographics data source
+// Demographics data source (unchanged)
 const DEMOS_DATASET_ID = 'Client_audits_data';
 const DEMOS_SOURCE_TABLE_ID = '1_demographics';
 
 // Demographics jobs table (target)
-const JOBS_DEMOS_TABLE_ID = 'jobs_demographics';
+const JOBS_DEMOS_TABLE_ID = '1_demographicJobs';
 
 // n8n webhook for organic search
 const ORGANIC_WEBHOOK_URL =
@@ -37,7 +37,6 @@ app.post('/', async (req, res) => {
     const envelope = req.body;
     if (!envelope || !envelope.message || !envelope.message.data) {
       console.error('❌ Invalid Pub/Sub message format:', JSON.stringify(envelope));
-      // ACK anyway so Pub/Sub doesn’t retry forever
       return res.status(204).send();
     }
 
@@ -50,7 +49,7 @@ app.post('/', async (req, res) => {
     const {
       jobId,
       location: locationFromMessage,
-      stage = 'demographics', // default so old messages still work
+      stage = 'demographics',
     } = payload;
 
     console.log(
@@ -68,11 +67,9 @@ app.post('/', async (req, res) => {
       stage,
     });
 
-    // Always ACK so Pub/Sub does not retry this message
     res.status(204).send();
   } catch (err) {
     console.error('❌ Error handling Pub/Sub message:', err);
-    // ACK even on error to avoid infinite retry loop
     res.status(204).send();
   }
 });
@@ -104,25 +101,6 @@ async function handleJobMessage({ jobId, locationFromMessage, stage }) {
       err
     );
   }
-}
-
-// ======================================================================
-//                     MAIN DEMOGRAPHICS ENTRYPOINT
-// ======================================================================
-
-async function processJobDemographics(jobId, locationFromMessage = null) {
-  console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
-
-  const job = await loadJob(jobId);
-
-  if (!job) {
-    console.warn(
-      `⚠️ [DEMOS] Job ${jobId} not found in ${DATASET_ID}.${JOBS_TABLE_ID}.`
-    );
-    return;
-  }
-
-  await processDemographicsStage(job, locationFromMessage);
 }
 
 // ======================================================================
@@ -172,9 +150,7 @@ async function processOrganicSearchStage(jobId) {
   try {
     const response = await fetch(ORGANIC_WEBHOOK_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
 
@@ -195,8 +171,27 @@ async function processOrganicSearchStage(jobId) {
     console.error(`❌ [ORG] Error calling n8n webhook for job ${jobId}:`, err);
   }
 
-  // Later: when 7_organicJobs is written + callback is wired,
-  // we'll mark 7_organicSearchStatus here.
+  // Later: when 7_organicSearch_Jobs is filled + callback wired,
+  // we'll update 7_organicSearch_Status here.
+}
+
+// ======================================================================
+//                     MAIN DEMOGRAPHICS ENTRYPOINT
+// ======================================================================
+
+async function processJobDemographics(jobId, locationFromMessage = null) {
+  console.log(`▶️ [DEMOS] Starting demographics processing for job ${jobId}`);
+
+  const job = await loadJob(jobId);
+
+  if (!job) {
+    console.warn(
+      `⚠️ [DEMOS] Job ${jobId} not found in ${DATASET_ID}.${JOBS_TABLE_ID}.`
+    );
+    return;
+  }
+
+  await processDemographicsStage(job, locationFromMessage);
 }
 
 // ======================================================================
@@ -286,7 +281,7 @@ async function processDemographicsStage(job, locationOverride = null) {
   );
 
   console.log(
-    '➡️ [DEMOS] Step 4: MERGE into jobs_demographics with demographics values'
+    '➡️ [DEMOS] Step 4: MERGE into 1_demographicJobs with demographics values'
   );
 
   const parsed = {
@@ -395,7 +390,7 @@ async function processDemographicsStage(job, locationOverride = null) {
     );
   } catch (err) {
     console.error(
-      `❌ [DEMOS] MERGE FAILED for job ${jobId} into jobs_demographics:`,
+      `❌ [DEMOS] MERGE FAILED for job ${jobId} into 1_demographicJobs:`,
       JSON.stringify(err.errors || err, null, 2)
     );
 
@@ -428,7 +423,7 @@ function getSafeJobDateIso(createdAt) {
   const nowIso = new Date().toISOString();
   if (!createdAt) {
     console.warn(
-      `⚠️ [DEMOS] Job createdAt is NULL/undefined; using now() as date for jobs_demographics.`
+      `⚠️ [DEMOS] Job createdAt is NULL/undefined; using now() as date for 1_demographicJobs.`
     );
     return nowIso;
   }
@@ -441,7 +436,7 @@ function getSafeJobDateIso(createdAt) {
   const d = new Date(raw);
   if (Number.isNaN(d.getTime())) {
     console.warn(
-      `⚠️ [DEMOS] Invalid createdAt value "${raw}"; using now() as date for jobs_demographics.`
+      `⚠️ [DEMOS] Invalid createdAt value "${raw}"; using now() as date for 1_demographicJobs.`
     );
     return nowIso;
   }
@@ -458,9 +453,9 @@ async function loadJob(jobId) {
         jobId,
         location,
         services,
-        demographicsStatus,
-        paidAdsStatus,
-        \`7_organicSearchStatus\` AS organicSearchStatus,
+        \`1_demographics_Status\` AS demographicsStatus,
+        \`8_paidAds_Status\` AS paidAdsStatus,
+        \`7_organicSearch_Status\` AS organicSearchStatus,
         status,
         createdAt
       FROM \`${PROJECT_ID}.${DATASET_ID}.${JOBS_TABLE_ID}\`
@@ -478,9 +473,9 @@ async function loadJob(jobId) {
 // Mark any segment status on the main jobs table
 async function markSegmentStatus(jobId, segmentField, status) {
   const fieldMap = {
-    demographicsStatus: 'demographicsStatus',
-    paidAdsStatus: 'paidAdsStatus',
-    organicSearchStatus: '7_organicSearchStatus',
+    demographicsStatus: '1_demographics_Status',
+    paidAdsStatus: '8_paidAds_Status',
+    organicSearchStatus: '7_organicSearch_Status',
   };
 
   const columnName = fieldMap[segmentField];
@@ -517,9 +512,7 @@ async function maybeMarkJobCompleted(jobId) {
   try {
     const job = await loadJob(jobId);
     if (!job) {
-      console.warn(
-        `⚠️ maybeMarkJobCompleted: job ${jobId} not found.`
-      );
+      console.warn(`⚠️ maybeMarkJobCompleted: job ${jobId} not found.`);
       return;
     }
 
