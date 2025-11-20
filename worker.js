@@ -10,7 +10,7 @@ const PROJECT_ID = 'ghs-construction-1734441714520';
 const DATASET_ID = 'Client_audits';
 const JOBS_TABLE_ID = 'client_audits_jobs';
 
-// Demographics data source (unchanged)
+// Demographics data source
 const DEMOS_DATASET_ID = 'Client_audits_data';
 const DEMOS_SOURCE_TABLE_ID = '1_demographics';
 
@@ -257,7 +257,6 @@ async function processDemographicsStage(job, locationOverride = null) {
 
     await overwriteJobsDemographicsRow(jobId, {
       jobId,
-      location,
       date: jobDateIso,
       population_no: null,
       median_age: null,
@@ -328,7 +327,6 @@ async function processDemographicsStage(job, locationOverride = null) {
       USING (
         SELECT
           @jobId AS jobId,
-          @location AS location,
           @population_no AS population_no,
           @median_age AS median_age,
           @households_no AS households_no,
@@ -344,7 +342,6 @@ async function processDemographicsStage(job, locationOverride = null) {
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
         UPDATE SET
-          location = S.location,
           population_no = S.population_no,
           median_age = S.median_age,
           households_no = S.households_no,
@@ -357,10 +354,10 @@ async function processDemographicsStage(job, locationOverride = null) {
           createdAt = S.createdAt,
           updatedAt = S.updatedAt
       WHEN NOT MATCHED THEN
-        INSERT (jobId, location, population_no, median_age, households_no,
+        INSERT (jobId, population_no, median_age, households_no,
                 median_income_households, median_income_families,
                 male_percentage, female_percentage, status, date, createdAt, updatedAt)
-        VALUES (S.jobId, S.location, S.population_no, S.median_age, S.households_no,
+        VALUES (S.jobId, S.population_no, S.median_age, S.households_no,
                 S.median_income_households, S.median_income_families,
                 S.male_percentage, S.female_percentage, S.status, S.date, S.createdAt, S.updatedAt)
     `;
@@ -369,7 +366,6 @@ async function processDemographicsStage(job, locationOverride = null) {
       query: mergeQuery,
       params: {
         jobId,
-        location,
         population_no: parsed.population_no,
         median_age: parsed.median_age,
         households_no: parsed.households_no,
@@ -567,7 +563,6 @@ async function overwriteJobsDemographicsRow(jobId, data) {
   const nowIso = new Date().toISOString();
   const row = {
     jobId: data.jobId,
-    location: data.location || null,
     population_no: data.population_no ?? null,
     median_age: data.median_age ?? null,
     households_no: data.households_no ?? null,
@@ -587,7 +582,6 @@ async function overwriteJobsDemographicsRow(jobId, data) {
       USING (
         SELECT
           @jobId AS jobId,
-          @location AS location,
           @population_no AS population_no,
           @median_age AS median_age,
           @households_no AS households_no,
@@ -603,7 +597,6 @@ async function overwriteJobsDemographicsRow(jobId, data) {
       ON T.jobId = S.jobId
       WHEN MATCHED THEN
         UPDATE SET
-          location = S.location,
           population_no = S.population_no,
           median_age = S.median_age,
           households_no = S.households_no,
@@ -616,10 +609,10 @@ async function overwriteJobsDemographicsRow(jobId, data) {
           createdAt = S.createdAt,
           updatedAt = S.updatedAt
       WHEN NOT MATCHED THEN
-        INSERT (jobId, location, population_no, median_age, households_no,
+        INSERT (jobId, population_no, median_age, households_no,
                 median_income_households, median_income_families,
                 male_percentage, female_percentage, status, date, createdAt, updatedAt)
-        VALUES (S.jobId, S.location, S.population_no, S.median_age, S.households_no,
+        VALUES (S.jobId, S.population_no, S.median_age, S.households_no,
                 S.median_income_households, S.median_income_families,
                 S.male_percentage, S.female_percentage, S.status, S.date, S.createdAt, S.updatedAt)
     `;
@@ -628,7 +621,6 @@ async function overwriteJobsDemographicsRow(jobId, data) {
       query: mergeQuery,
       params: {
         jobId: row.jobId,
-        location: row.location,
         population_no: row.population_no,
         median_age: row.median_age,
         households_no: row.households_no,
