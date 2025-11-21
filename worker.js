@@ -12,8 +12,14 @@ const app = express();
 app.use(bodyParser.json());
 
 /**
- * Pub/Sub push endpoint – receives messages with stage + jobId.
- * This ONLY runs the specified stage. Stages do NOT trigger each other.
+ * Pub/Sub push endpoint – receives messages with stage + jobId
+ * Topic payload (before base64) is expected to look like:
+ * {
+ *   "jobId": "...",
+ *   "location": "Redding city, California",
+ *   "createdAt": "2025-11-21T10:03:25.912Z",
+ *   "stage": "demographics" | "7_organicSearch" | ...
+ * }
  */
 app.post('/', async (req, res) => {
   try {
@@ -24,8 +30,18 @@ app.post('/', async (req, res) => {
       return;
     }
 
+    // Decode Pub/Sub data
     const dataBuffer = Buffer.from(message.data, 'base64');
-    const payload = JSON.parse(dataBuffer.toString('utf8'));
+    const payloadStr = dataBuffer.toString('utf8');
+
+    let payload;
+    try {
+      payload = JSON.parse(payloadStr);
+    } catch (err) {
+      console.error('❌ Failed to parse Pub/Sub message data as JSON:', payloadStr, err);
+      res.status(400).send('Bad Request: invalid JSON');
+      return;
+    }
 
     const { jobId, location, createdAt, stage } = payload;
 
@@ -33,7 +49,7 @@ app.post('/', async (req, res) => {
 
     if (!jobId || !stage) {
       console.error('❌ Missing jobId or stage in Pub/Sub payload');
-      res.status(400).send('Bad Request');
+      res.status(400).send('Bad Request: missing jobId or stage');
       return;
     }
 
@@ -41,110 +57,33 @@ app.post('/', async (req, res) => {
       `✅ Worker received job ${jobId} (stage=${stage}, location=${location})`
     );
 
+    // Route by stage – each segment is responsible for checking its own status
     switch (stage) {
       case 'demographics':
         await handleDemographicsSegment(jobId);
         break;
+
       case '7_organicSearch':
         await handleOrganicSearchSegment(jobId);
         break;
+
       default:
         console.log(`ℹ️ Unknown stage "${stage}" - nothing to do yet.`);
         break;
     }
 
-    // Always ACK Pub/Sub (no retry loops at this level)
+    // Success – acknowledge to Pub/Sub so it doesn’t retry
     res.status(204).send();
   } catch (err) {
     console.error('❌ Error handling Pub/Sub message:', err);
-    // Let Pub/Sub retry on error:
+    // 500 → Pub/Sub will retry, but segments should short-circuit if not queued
     res.status(500).send();
   }
 });
 
 /**
- * Manual trigger endpoint to run a specific segment for a given jobId.
- * Useful for re-running stuck segments.
- *
- * POST /run-segment
- * {
- *   "jobId": "uuid",
- *   "stage": "demographics" | "7_organicSearch"
- * }
- */
-app.post('/run-segment', async (req, res) => {
-  try {
-    const { jobId, stage } = req.body || {};
-    if (!jobId || !stage) {
-      res
-        .status(400)
-        .json({ error: 'jobId and stage are required in body' });
-      return;
-    }
-
-    console.log(
-      `🧪 [MANUAL] Manually triggering stage=${stage} for job ${jobId}`
-    );
-
-    switch (stage) {
-      case 'demographics':
-        await handleDemographicsSegment(jobId);
-        break;
-      case '7_organicSearch':
-        await handleOrganicSearchSegment(jobId);
-        break;
-      default:
-        res.status(400).json({ error: `Unknown stage: ${stage}` });
-        return;
-    }
-
-    res.status(200).json({ ok: true, jobId, stage });
-  } catch (err) {
-    console.error('❌ Error in /run-segment manual handler:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
- * Dedicated manual endpoints if you want them even simpler:
- * POST /run-demographics { "jobId": "..." }
- * POST /run-organic     { "jobId": "..." }
- */
-app.post('/run-demographics', async (req, res) => {
-  try {
-    const { jobId } = req.body || {};
-    if (!jobId) {
-      res.status(400).json({ error: 'jobId is required' });
-      return;
-    }
-    console.log(`🧪 [MANUAL] /run-demographics for job ${jobId}`);
-    await handleDemographicsSegment(jobId);
-    res.status(200).json({ ok: true, jobId, stage: 'demographics' });
-  } catch (err) {
-    console.error('❌ Error in /run-demographics:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.post('/run-organic', async (req, res) => {
-  try {
-    const { jobId } = req.body || {};
-    if (!jobId) {
-      res.status(400).json({ error: 'jobId is required' });
-      return;
-    }
-    console.log(`🧪 [MANUAL] /run-organic for job ${jobId}`);
-    await handleOrganicSearchSegment(jobId);
-    res.status(200).json({ ok: true, jobId, stage: '7_organicSearch' });
-  } catch (err) {
-    console.error('❌ Error in /run-organic:', err);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-/**
  * Callback endpoint for organic search results from n8n.
- * Body is your current organic JSON blob / array.
+ * Expects an array with at least one item that includes jobId + rank fields.
  */
 app.post('/organic-result', async (req, res) => {
   try {
@@ -163,7 +102,44 @@ app.get('/', (req, res) => {
   res.status(200).send('OK');
 });
 
+/**
+ * Optional: manual trigger endpoint to run a segment by hand.
+ * POST /trigger  { "jobId": "...", "stage": "demographics" | "7_organicSearch" }
+ */
+app.post('/trigger', async (req, res) => {
+  try {
+    const { jobId, stage } = req.body || {};
+    if (!jobId || !stage) {
+      res.status(400).json({ error: 'Missing jobId or stage' });
+      return;
+    }
+
+    console.log(`🧪 Manual trigger for job ${jobId}, stage=${stage}`);
+
+    switch (stage) {
+      case 'demographics':
+        await handleDemographicsSegment(jobId);
+        break;
+
+      case '7_organicSearch':
+        await handleOrganicSearchSegment(jobId);
+        break;
+
+      default:
+        res.status(400).json({ error: `Unknown stage "${stage}"` });
+        return;
+    }
+
+    res.status(200).json({ ok: true, jobId, stage });
+  } catch (err) {
+    console.error('❌ Error in /trigger handler:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 client-audits-worker listening on port ${PORT}`);
 });
+
+module.exports = app;
