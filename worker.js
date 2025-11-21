@@ -65,16 +65,15 @@ function bqTimestampToIso(ts) {
 }
 
 /**
- * Force value into string or null (BigQuery param-safe).
+ * Force value into STRING (never null) so BigQuery doesn't need explicit types.
  */
 function safeStr(v) {
-  if (v === undefined || v === null) return null;
+  if (v === undefined || v === null) return '';
   return String(v);
 }
 
 /**
  * Update a specific "segment status" column (e.g. 1_demographics_Status).
- * NOTE: we wrap the column name in backticks because it starts with a number.
  */
 async function markSegmentStatus(jobId, statusColumn, newStatus) {
   console.log(
@@ -206,6 +205,7 @@ const MERGE_DEMOGRAPHICS_SQL = `
 
 /**
  * MERGE SQL for organic search results table.
+ * Match ONLY on jobId, but also store businessName.
  */
 const MERGE_ORGANIC_SQL = `
   MERGE \`${ORGANIC_JOBS_TABLE}\` T
@@ -213,6 +213,7 @@ const MERGE_ORGANIC_SQL = `
     SELECT
       @jobId AS jobId,
       TIMESTAMP(@dateIso) AS date,
+      @businessName AS businessName,
       @website AS website,
       @rank1Name AS rank1Name, @rank1Url AS rank1Url,
       @rank2Name AS rank2Name, @rank2Url AS rank2Url,
@@ -228,6 +229,7 @@ const MERGE_ORGANIC_SQL = `
   ON T.jobId = S.jobId
   WHEN MATCHED THEN UPDATE SET
     T.date = S.date,
+    T.businessName = S.businessName,
     T.website = S.website,
     T.rank1Name = S.rank1Name, T.rank1Url = S.rank1Url,
     T.rank2Name = S.rank2Name, T.rank2Url = S.rank2Url,
@@ -241,7 +243,7 @@ const MERGE_ORGANIC_SQL = `
     T.rank10Name = S.rank10Name, T.rank10Url = S.rank10Url
   WHEN NOT MATCHED THEN
     INSERT (
-      jobId, date, website,
+      jobId, date, businessName, website,
       rank1Name, rank1Url,
       rank2Name, rank2Url,
       rank3Name, rank3Url,
@@ -254,7 +256,7 @@ const MERGE_ORGANIC_SQL = `
       rank10Name, rank10Url
     )
     VALUES (
-      S.jobId, S.date, S.website,
+      S.jobId, S.date, S.businessName, S.website,
       S.rank1Name, S.rank1Url,
       S.rank2Name, S.rank2Url,
       S.rank3Name, S.rank3Url,
@@ -288,13 +290,11 @@ async function handleDemographicsStage(jobId) {
     )}`
   );
 
-  // Step 2: mark demographics segment as pending
   console.log(
     "➡️ [DEMOS] Step 2: Mark main job 1_demographics_Status = 'pending'"
   );
   await markSegmentStatus(jobId, '1_demographics_Status', 'pending');
 
-  // Step 3: Load demographics from source table
   console.log(
     '➡️ [DEMOS] Step 3: Load demographics from Client_audits_data.1_demographics'
   );
@@ -345,7 +345,7 @@ async function handleDemographicsStage(jobId) {
         jobId,
         dateIso: createdAtIso,
         status: 'completed',
-        businessName: job.businessName || null,
+        businessName: safeStr(job.businessName),
         population_no: d.population_no,
         households_no: d.households_no,
         median_age: d.median_age,
@@ -387,7 +387,6 @@ async function handleOrganicStage(jobId) {
   const job = await loadJob(jobId);
   if (!job) {
     console.warn(`[ORG] No job row found for jobId ${jobId}`);
-    // nothing else we can do here
     return;
   }
 
@@ -434,7 +433,8 @@ async function handleOrganicStage(jobId) {
 
     // Seed an empty row in 7_organicSearch_Jobs as soon as the webhook is sent
     const dateIso = bqTimestampToIso(job.createdAt);
-    const website = job.website ? String(job.website) : null;
+    const website = safeStr(job.website);
+    const businessName = safeStr(job.businessName);
 
     console.log(
       `ℹ️ [ORG] Seeding empty row in ${ORGANIC_JOBS_TABLE} for job ${jobId}`
@@ -446,18 +446,20 @@ async function handleOrganicStage(jobId) {
           SELECT
             @jobId AS jobId,
             TIMESTAMP(@dateIso) AS date,
+            @businessName AS businessName,
             @website AS website
         ) S
         ON T.jobId = S.jobId
         WHEN MATCHED THEN
           UPDATE SET
             T.date = S.date,
+            T.businessName = S.businessName,
             T.website = S.website
         WHEN NOT MATCHED THEN
-          INSERT (jobId, date, website)
-          VALUES (S.jobId, S.date, S.website)
+          INSERT (jobId, date, businessName, website)
+          VALUES (S.jobId, S.date, S.businessName, S.website)
       `,
-      params: { jobId, dateIso, website },
+      params: { jobId, dateIso, businessName, website },
     });
   } catch (err) {
     console.error(
@@ -510,7 +512,7 @@ app.post('/organic-result', async (req, res) => {
         continue;
       }
 
-      // Load job for date & website
+      // Load job for date & businessName & website
       const job = await loadJob(jobId);
       if (!job) {
         console.warn(
@@ -521,7 +523,8 @@ app.post('/organic-result', async (req, res) => {
       }
 
       const dateIso = bqTimestampToIso(job.createdAt);
-      const website = job.website ? String(job.website) : null;
+      const website = safeStr(job.website);
+      const businessName = safeStr(job.businessName);
 
       console.log(
         `▶️ [ORG-CB] Processing organic callback for job ${jobId} (location=${job.location}, services=${job.services})`
@@ -533,6 +536,7 @@ app.post('/organic-result', async (req, res) => {
           params: {
             jobId,
             dateIso,
+            businessName,
             website,
             rank1Name: safeStr(rank1Name),
             rank1Url: safeStr(rank1Url),
