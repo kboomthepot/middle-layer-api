@@ -91,7 +91,13 @@ async function markSegmentStatus(jobId, statusColumn, newStatus) {
 }
 
 /**
- * Optionally mark the whole job as completed if all key segments are done.
+ * Recompute and update the main job status based on segment statuses.
+ *
+ * Rules:
+ * - 'queued'    → if ALL segment statuses are 'queued'
+ * - 'pending'   → if ANY segment status is 'pending' (and none are 'failed')
+ * - 'failed'    → if ANY segment status is 'failed'
+ * - 'completed' → only if ALL segment statuses are 'completed'
  */
 async function maybeMarkJobCompleted(jobId) {
   console.log('➡️ Load job row from client_audits_jobs');
@@ -123,23 +129,39 @@ async function maybeMarkJobCompleted(jobId) {
     `ℹ️ maybeMarkJobCompleted: current segments for ${jobId} => demo=${demo}, organic=${organic}, paid=${paid}`
   );
 
-  if (demo === 'completed' && organic === 'completed' && paid === 'completed') {
-    await bigquery.query({
-      query: `
-        UPDATE \`${JOBS_TABLE}\`
-        SET status = 'completed'
-        WHERE jobId = @jobId
-      `,
-      params: { jobId },
-    });
-    console.log(
-      `ℹ️ maybeMarkJobCompleted: marked job ${jobId} status='completed'.`
-    );
-  } else {
-    console.log(
-      `ℹ️ maybeMarkJobCompleted: job ${jobId} not fully completed yet (required segment statuses=completed,completed,completed).`
-    );
+  const segments = [demo, organic, paid];
+  const currentStatus = job.status || 'queued';
+  let newStatus = currentStatus;
+
+  if (segments.every((s) => s === 'queued')) {
+    newStatus = 'queued';
+  } else if (segments.some((s) => s === 'failed')) {
+    newStatus = 'failed';
+  } else if (segments.every((s) => s === 'completed')) {
+    newStatus = 'completed';
+  } else if (segments.some((s) => s === 'pending')) {
+    newStatus = 'pending';
   }
+
+  if (newStatus === currentStatus) {
+    console.log(
+      `ℹ️ maybeMarkJobCompleted: job ${jobId} main status remains '${currentStatus}'.`
+    );
+    return;
+  }
+
+  await bigquery.query({
+    query: `
+      UPDATE \`${JOBS_TABLE}\`
+      SET status = @newStatus
+      WHERE jobId = @jobId
+    `,
+    params: { jobId, newStatus },
+  });
+
+  console.log(
+    `ℹ️ maybeMarkJobCompleted: updated job ${jobId} status='${newStatus}'.`
+  );
 }
 
 /**
@@ -323,6 +345,7 @@ async function handleDemographicsStage(jobId) {
       `[DEMOS] No demographics row found for location "${job.location}", marking failed.`
     );
     await markSegmentStatus(jobId, '1_demographics_Status', 'failed');
+    await maybeMarkJobCompleted(jobId);
     return;
   }
 
@@ -364,6 +387,7 @@ async function handleDemographicsStage(jobId) {
       err && err.errors ? err.errors : err
     );
     await markSegmentStatus(jobId, '1_demographics_Status', 'failed');
+    await maybeMarkJobCompleted(jobId);
     return;
   }
 
@@ -373,7 +397,7 @@ async function handleDemographicsStage(jobId) {
   await markSegmentStatus(jobId, '1_demographics_Status', 'completed');
 
   console.log(
-    '➡️ [DEMOS] Step 6: Optionally mark main job status = completed if all segments done'
+    '➡️ [DEMOS] Step 6: Recompute main job status based on all segments'
   );
   await maybeMarkJobCompleted(jobId);
 }
@@ -467,6 +491,7 @@ async function handleOrganicStage(jobId) {
       err.message || err
     );
     await markSegmentStatus(jobId, '7_organicSearch_Status', 'failed');
+    await maybeMarkJobCompleted(jobId);
   }
 }
 
@@ -519,6 +544,7 @@ app.post('/organic-result', async (req, res) => {
           `[ORG-CB] No job row found for jobId ${jobId}, marking segment failed`
         );
         await markSegmentStatus(jobId, '7_organicSearch_Status', 'failed');
+        await maybeMarkJobCompleted(jobId);
         continue;
       }
 
@@ -572,6 +598,7 @@ app.post('/organic-result', async (req, res) => {
           err && err.errors ? err.errors : err
         );
         await markSegmentStatus(jobId, '7_organicSearch_Status', 'failed');
+        await maybeMarkJobCompleted(jobId);
       }
     }
 
