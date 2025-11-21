@@ -65,6 +65,14 @@ function bqTimestampToIso(ts) {
 }
 
 /**
+ * Force value into string or null (BigQuery param-safe).
+ */
+function safeStr(v) {
+  if (v === undefined || v === null) return null;
+  return String(v);
+}
+
+/**
  * Update a specific "segment status" column (e.g. 1_demographics_Status).
  * NOTE: we wrap the column name in backticks because it starts with a number.
  */
@@ -371,7 +379,7 @@ async function handleDemographicsStage(jobId) {
 }
 
 /**
- * ORGANIC SEARCH STAGE (trigger N8N)
+ * ORGANIC SEARCH STAGE (trigger N8N + seed empty row)
  */
 async function handleOrganicStage(jobId) {
   console.log(`▶️ [ORG] Starting organic search processing for job ${jobId}`);
@@ -379,6 +387,7 @@ async function handleOrganicStage(jobId) {
   const job = await loadJob(jobId);
   if (!job) {
     console.warn(`[ORG] No job row found for jobId ${jobId}`);
+    // nothing else we can do here
     return;
   }
 
@@ -422,6 +431,34 @@ async function handleOrganicStage(jobId) {
         resp.data
       )}`
     );
+
+    // Seed an empty row in 7_organicSearch_Jobs as soon as the webhook is sent
+    const dateIso = bqTimestampToIso(job.createdAt);
+    const website = job.website ? String(job.website) : null;
+
+    console.log(
+      `ℹ️ [ORG] Seeding empty row in ${ORGANIC_JOBS_TABLE} for job ${jobId}`
+    );
+    await bigquery.query({
+      query: `
+        MERGE \`${ORGANIC_JOBS_TABLE}\` T
+        USING (
+          SELECT
+            @jobId AS jobId,
+            TIMESTAMP(@dateIso) AS date,
+            @website AS website
+        ) S
+        ON T.jobId = S.jobId
+        WHEN MATCHED THEN
+          UPDATE SET
+            T.date = S.date,
+            T.website = S.website
+        WHEN NOT MATCHED THEN
+          INSERT (jobId, date, website)
+          VALUES (S.jobId, S.date, S.website)
+      `,
+      params: { jobId, dateIso, website },
+    });
   } catch (err) {
     console.error(
       `❌ [ORG] n8n webhook call FAILED for job ${jobId}:`,
@@ -467,7 +504,9 @@ app.post('/organic-result', async (req, res) => {
       } = item;
 
       if (!jobId) {
-        console.warn('[ORG-CB] Missing jobId in organic result payload, skip');
+        console.warn(
+          '[ORG-CB] Missing jobId in organic result payload, skipping item'
+        );
         continue;
       }
 
@@ -475,13 +514,14 @@ app.post('/organic-result', async (req, res) => {
       const job = await loadJob(jobId);
       if (!job) {
         console.warn(
-          `[ORG-CB] No job row found for jobId ${jobId}, skipping merge`
+          `[ORG-CB] No job row found for jobId ${jobId}, marking segment failed`
         );
+        await markSegmentStatus(jobId, '7_organicSearch_Status', 'failed');
         continue;
       }
 
       const dateIso = bqTimestampToIso(job.createdAt);
-      const website = job.website || null;
+      const website = job.website ? String(job.website) : null;
 
       console.log(
         `▶️ [ORG-CB] Processing organic callback for job ${jobId} (location=${job.location}, services=${job.services})`
@@ -494,40 +534,41 @@ app.post('/organic-result', async (req, res) => {
             jobId,
             dateIso,
             website,
-            rank1Name,
-            rank1Url,
-            rank2Name,
-            rank2Url,
-            rank3Name,
-            rank3Url,
-            rank4Name,
-            rank4Url,
-            rank5Name,
-            rank5Url,
-            rank6Name,
-            rank6Url,
-            rank7Name,
-            rank7Url,
-            rank8Name,
-            rank8Url,
-            rank9Name,
-            rank9Url,
-            rank10Name,
-            rank10Url,
+            rank1Name: safeStr(rank1Name),
+            rank1Url: safeStr(rank1Url),
+            rank2Name: safeStr(rank2Name),
+            rank2Url: safeStr(rank2Url),
+            rank3Name: safeStr(rank3Name),
+            rank3Url: safeStr(rank3Url),
+            rank4Name: safeStr(rank4Name),
+            rank4Url: safeStr(rank4Url),
+            rank5Name: safeStr(rank5Name),
+            rank5Url: safeStr(rank5Url),
+            rank6Name: safeStr(rank6Name),
+            rank6Url: safeStr(rank6Url),
+            rank7Name: safeStr(rank7Name),
+            rank7Url: safeStr(rank7Url),
+            rank8Name: safeStr(rank8Name),
+            rank8Url: safeStr(rank8Url),
+            rank9Name: safeStr(rank9Name),
+            rank9Url: safeStr(rank9Url),
+            rank10Name: safeStr(rank10Name),
+            rank10Url: safeStr(rank10Url),
           },
         });
         console.log(
           `✅ [ORG-CB] MERGE completed for job ${jobId} into ${ORGANIC_JOBS_TABLE}`
         );
+
+        await markSegmentStatus(jobId, '7_organicSearch_Status', 'completed');
+        await maybeMarkJobCompleted(jobId);
       } catch (err) {
         console.error(
           `❌ [ORG-CB] MERGE FAILED for job ${jobId}:`,
           err && err.errors ? err.errors : err
         );
+        await markSegmentStatus(jobId, '7_organicSearch_Status', 'failed');
       }
-
-      await markSegmentStatus(jobId, '7_organicSearch_Status', 'completed');
-      await maybeMarkJobCompleted(jobId);
     }
 
     res.status(200).json({ ok: true });
