@@ -1,7 +1,6 @@
 // worker.js
 const express = require('express');
 const bodyParser = require('body-parser');
-const { BigQuery } = require('@google-cloud/bigquery');
 
 const { handleDemographicsSegment } = require('./demographics');
 const {
@@ -12,22 +11,17 @@ const {
 const app = express();
 app.use(bodyParser.json());
 
-const bigquery = new BigQuery();
-
-const PROJECT_ID = 'ghs-construction-1734441714520';
-const JOBS_TABLE = `${PROJECT_ID}.Client_audits.client_audits_jobs`;
-
 /**
- * Root Pub/Sub push endpoint
- * Receives messages with: { jobId, location, createdAt, stage }
+ * Pub/Sub push endpoint – receives messages with stage + jobId.
+ * This ONLY runs the specified stage. Stages do NOT trigger each other.
  */
 app.post('/', async (req, res) => {
   try {
     const message = req.body && req.body.message;
     if (!message || !message.data) {
       console.error('❌ Invalid Pub/Sub message format', req.body);
-      // Still ack so Pub/Sub doesn’t hammer us forever
-      return res.status(204).send();
+      res.status(400).send('Bad Request: no message.data');
+      return;
     }
 
     const dataBuffer = Buffer.from(message.data, 'base64');
@@ -39,54 +33,118 @@ app.post('/', async (req, res) => {
 
     if (!jobId || !stage) {
       console.error('❌ Missing jobId or stage in Pub/Sub payload');
-      // Ack anyway to avoid endless retries
-      return res.status(204).send();
+      res.status(400).send('Bad Request');
+      return;
     }
 
     console.log(
       `✅ Worker received job ${jobId} (stage=${stage}, location=${location})`
     );
 
-    // Route by stage – IMPORTANT: call the correct functions
-    try {
-      if (stage === 'demographics' || stage === '1_demographics') {
+    switch (stage) {
+      case 'demographics':
         await handleDemographicsSegment(jobId);
-      } else if (stage === '7_organicSearch') {
+        break;
+      case '7_organicSearch':
         await handleOrganicSearchSegment(jobId);
-      } else {
+        break;
+      default:
         console.log(`ℹ️ Unknown stage "${stage}" - nothing to do yet.`);
-      }
-    } catch (stageErr) {
-      // Any error inside a segment should already have updated statuses to "failed"
-      console.error(
-        `❌ Error while processing stage "${stage}" for job ${jobId}:`,
-        stageErr
-      );
-      // DO NOT rethrow – we still ack Pub/Sub below
+        break;
     }
 
-    // Always ack the Pub/Sub message so we don't get stuck in a loop
+    // Always ACK Pub/Sub (no retry loops at this level)
     res.status(204).send();
   } catch (err) {
-    console.error('❌ Error handling Pub/Sub message (outer):', err);
-    // Even if we blow up parsing, we still ack to stop infinite retries
-    res.status(204).send();
+    console.error('❌ Error handling Pub/Sub message:', err);
+    // Let Pub/Sub retry on error:
+    res.status(500).send();
   }
 });
 
 /**
- * Callback endpoint for organic search results from n8n
- * Body example:
- * [
- *   {
- *     jobId: "...",
- *     services: "deck building",
- *     location: "Redding city, California",
- *     rank1Name: "...",
- *     rank1Url: "...",
- *     ...
- *   }
- * ]
+ * Manual trigger endpoint to run a specific segment for a given jobId.
+ * Useful for re-running stuck segments.
+ *
+ * POST /run-segment
+ * {
+ *   "jobId": "uuid",
+ *   "stage": "demographics" | "7_organicSearch"
+ * }
+ */
+app.post('/run-segment', async (req, res) => {
+  try {
+    const { jobId, stage } = req.body || {};
+    if (!jobId || !stage) {
+      res
+        .status(400)
+        .json({ error: 'jobId and stage are required in body' });
+      return;
+    }
+
+    console.log(
+      `🧪 [MANUAL] Manually triggering stage=${stage} for job ${jobId}`
+    );
+
+    switch (stage) {
+      case 'demographics':
+        await handleDemographicsSegment(jobId);
+        break;
+      case '7_organicSearch':
+        await handleOrganicSearchSegment(jobId);
+        break;
+      default:
+        res.status(400).json({ error: `Unknown stage: ${stage}` });
+        return;
+    }
+
+    res.status(200).json({ ok: true, jobId, stage });
+  } catch (err) {
+    console.error('❌ Error in /run-segment manual handler:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Dedicated manual endpoints if you want them even simpler:
+ * POST /run-demographics { "jobId": "..." }
+ * POST /run-organic     { "jobId": "..." }
+ */
+app.post('/run-demographics', async (req, res) => {
+  try {
+    const { jobId } = req.body || {};
+    if (!jobId) {
+      res.status(400).json({ error: 'jobId is required' });
+      return;
+    }
+    console.log(`🧪 [MANUAL] /run-demographics for job ${jobId}`);
+    await handleDemographicsSegment(jobId);
+    res.status(200).json({ ok: true, jobId, stage: 'demographics' });
+  } catch (err) {
+    console.error('❌ Error in /run-demographics:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.post('/run-organic', async (req, res) => {
+  try {
+    const { jobId } = req.body || {};
+    if (!jobId) {
+      res.status(400).json({ error: 'jobId is required' });
+      return;
+    }
+    console.log(`🧪 [MANUAL] /run-organic for job ${jobId}`);
+    await handleOrganicSearchSegment(jobId);
+    res.status(200).json({ ok: true, jobId, stage: '7_organicSearch' });
+  } catch (err) {
+    console.error('❌ Error in /run-organic:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Callback endpoint for organic search results from n8n.
+ * Body is your current organic JSON blob / array.
  */
 app.post('/organic-result', async (req, res) => {
   try {
@@ -94,9 +152,7 @@ app.post('/organic-result', async (req, res) => {
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error('❌ Error in /organic-result handler:', err);
-    // We still respond 200 so n8n doesn’t keep retrying forever.
-    // Inside handleOrganicResultCallback you should already mark the segment as failed.
-    res.status(200).json({ ok: false, error: 'merge_failed' });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 
