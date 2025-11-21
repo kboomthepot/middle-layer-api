@@ -1,7 +1,7 @@
 // organicSearch.js
 const { BigQuery } = require('@google-cloud/bigquery');
 const axios = require('axios');
-const { markSegmentStatus } = require('./status');
+const { markSegmentStatus, recomputeMainStatus } = require('./status');
 
 const bigquery = new BigQuery();
 
@@ -9,13 +9,11 @@ const PROJECT_ID = 'ghs-construction-1734441714520';
 const JOBS_TABLE = `${PROJECT_ID}.Client_audits.client_audits_jobs`;
 const ORG_TABLE = `${PROJECT_ID}.Client_audits.7_organicSearch_Jobs`;
 
-// ⚠️ Make sure this matches your actual n8n webhook URL
-const N8N_WEBHOOK_URL =
+// 🔧 configure via env var
+const N8N_ORG_WEBHOOK_URL =
+  process.env.N8N_ORG_WEBHOOK_URL ||
   'https://n8n.srv974379.hstgr.cloud/webhook/07_organicSearch';
 
-/**
- * Load a single job row from client_audits_jobs.
- */
 async function loadJob(jobId) {
   const [rows] = await bigquery.query({
     query: `
@@ -24,247 +22,353 @@ async function loadJob(jobId) {
         location,
         businessName,
         services,
-        createdAt,
         1_demographics_Status AS demographicsStatus,
         7_organicSearch_Status AS organicSearchStatus,
-        8_paidAds_Status AS paidAdsStatus,
-        status
+        paidAdsStatus,
+        status,
+        createdAt
       FROM \`${JOBS_TABLE}\`
       WHERE jobId = @jobId
+      LIMIT 1
     `,
     params: { jobId },
   });
-
-  if (!rows.length) {
-    console.warn(`[ORG] loadJob: no job row found for jobId=${jobId}`);
-    return null;
-  }
-
-  return rows[0];
+  return rows[0] || null;
 }
 
-/**
- * Normalize the services field (it might be JSON string, array, or simple string).
- */
-function normalizeServices(raw) {
-  if (!raw) return [];
-  if (Array.isArray(raw)) return raw;
-
-  if (typeof raw === 'string') {
-    const trimmed = raw.trim();
-    if (!trimmed) return [];
-    // Try to parse JSON string
+function parseServices(servicesField) {
+  if (!servicesField) return [];
+  if (Array.isArray(servicesField)) return servicesField;
+  if (typeof servicesField === 'string') {
     try {
-      const parsed = JSON.parse(trimmed);
+      const parsed = JSON.parse(servicesField);
       if (Array.isArray(parsed)) return parsed;
-      return [trimmed];
-    } catch (_err) {
-      return [trimmed];
+    } catch (e) {
+      // fall through
+      return [servicesField];
     }
   }
-
-  // Fallback
-  return [String(raw)];
+  return [];
 }
 
-/**
- * Handle the "7_organicSearch" segment when triggered by Pub/Sub.
- * This:
- *  - loads the job row,
- *  - checks segment status == 'queued',
- *  - marks segment as 'pending',
- *  - sends payload to n8n,
- *  - upserts an initial row in 7_organicSearch_Jobs with status='pending'.
- */
 async function handleOrganicSearchSegment(jobId) {
   console.log(`▶️ [ORG] Starting organic search processing for job ${jobId}`);
 
-  if (!jobId) {
-    console.error('[ORG] handleOrganicSearchSegment called without jobId');
-    return;
-  }
-
-  const jobRow = await loadJob(jobId);
-  if (!jobRow) {
-    console.error(`[ORG] No job row found for jobId=${jobId}, aborting organic segment.`);
-    // If you want, you could mark the segment as failed here.
+  const job = await loadJob(jobId);
+  if (!job) {
+    console.warn(`⚠️ [ORG] No job row found for jobId=${jobId}, skipping.`);
     return;
   }
 
   const {
     location,
     businessName,
-    services: rawServices,
-    createdAt,
     organicSearchStatus,
-  } = jobRow;
+    createdAt,
+    services,
+  } = job;
 
-  console.log(
-    `ℹ️ [ORG] Job ${jobId} location = "${location}", organicSearchStatus = ${organicSearchStatus}, services = ${JSON.stringify(
-      rawServices
-    )}`
-  );
-
-  // Only run this if the segment is queued or null.
+  // 🔒 Idempotency guard: only run when status is "queued"
   if (organicSearchStatus && organicSearchStatus !== 'queued') {
     console.log(
-      `[ORG] Segment 7_organicSearch_Status is "${organicSearchStatus}", not 'queued' – skipping.`
+      `ℹ️ [ORG] Job ${jobId} organicSearchStatus=${organicSearchStatus}, not 'queued' – skipping.`
     );
     return;
   }
 
-  // Mark segment as pending on main job
+  const servicesArr = parseServices(services);
+
+  console.log(
+    `ℹ️ [ORG] Job ${jobId} location = "${location}", organicSearchStatus = ${organicSearchStatus}, services = ${JSON.stringify(
+      servicesArr
+    )}`
+  );
+
+  // Step 1: mark segment pending
   await markSegmentStatus(jobId, '7_organicSearch_Status', 'pending');
 
-  const services = normalizeServices(rawServices);
-
+  // Step 2: send payload to n8n
   const payload = {
     jobId,
     location,
-    services,
+    services: servicesArr,
   };
 
   console.log(
-    `ℹ️ [ORG] Sending payload to n8n webhook: ${N8N_WEBHOOK_URL} → ${JSON.stringify(
+    `ℹ️ [ORG] Sending payload to n8n webhook: ${N8N_ORG_WEBHOOK_URL} → ${JSON.stringify(
       payload
     )}`
   );
 
-  await axios.post(N8N_WEBHOOK_URL, payload, { timeout: 30000 });
-
+  await axios.post(N8N_ORG_WEBHOOK_URL, payload, { timeout: 30000 });
   console.log(
-    `✅ [ORG] n8n webhook call succeeded for job ${jobId}. Response: (not logged)`
+    `✅ [ORG] n8n webhook call succeeded for job ${jobId}. Response: "Workflow was started"`
   );
 
-  // Upsert initial row in 7_organicSearch_Jobs with status='pending'
-  console.log(
-    `ℹ️ [ORG] Upserting initial row into ${ORG_TABLE} for job ${jobId} with status='pending'`
-  );
+  // Step 3: insert or update initial row in 7_organicSearch_Jobs with pending status
+  const createdAtTs = createdAt?.value || createdAt || null;
 
-  const mergeSql = `
-    MERGE \`${ORG_TABLE}\` T
-    USING (
-      SELECT
-        @jobId AS jobId,
-        @businessName AS businessName,
-        @createdAt AS date,
-        'pending' AS status
-    ) S
-    ON T.jobId = S.jobId
-    WHEN NOT MATCHED THEN
-      INSERT (jobId, businessName, date, status)
-      VALUES (S.jobId, S.businessName, S.date, S.status)
-  `;
+  console.log(
+    `ℹ️ [ORG] Inserting initial row into ${ORG_TABLE} for job ${jobId} with status='pending'`
+  );
 
   await bigquery.query({
-    query: mergeSql,
+    query: `
+      MERGE \`${ORG_TABLE}\` T
+      USING (
+        SELECT
+          @jobId AS jobId,
+          @businessName AS businessName,
+          @date AS date,
+          'pending' AS status
+      ) S
+      ON T.jobId = S.jobId
+      WHEN NOT MATCHED THEN
+        INSERT (jobId, businessName, date, status)
+        VALUES (S.jobId, S.businessName, S.date, S.status)
+      WHEN MATCHED THEN
+        UPDATE SET
+          businessName = S.businessName,
+          date = S.date,
+          status = S.status
+    `,
     params: {
       jobId,
       businessName: businessName || null,
-      createdAt: createdAt || null,
+      date: createdAtTs,
+    },
+    types: {
+      jobId: 'STRING',
+      businessName: 'STRING',
+      date: 'TIMESTAMP',
     },
   });
-
-  console.log(
-    `✅ [ORG] Initial row ensured in ${ORG_TABLE} for job ${jobId} (status=pending)`
-  );
 }
 
 /**
- * Callback handler for organic results from n8n.
- *
- * Expected body from n8n (first item example):
+ * Callback from n8n with final organic results.
+ * body example:
  * [
  *   {
  *     "jobId": "...",
  *     "rank1Name": "...",
  *     "rank1Url": "...",
  *     ...
- *     "rank10Name": "...",
- *     "rank10Url": "..."
  *   }
  * ]
  */
 async function handleOrganicResultCallback(body) {
-  console.log('📥 [/organic-result] Received organic result payload:', body);
-
-  if (!Array.isArray(body) || !body.length) {
-    console.warn('[ORG-CB] Callback body is empty or not an array, ignoring.');
-    return;
-  }
-
-  const item = body[0];
-  const jobId = item.jobId || item.jobID || item.JobId;
+  const item = Array.isArray(body) ? body[0] : body || {};
+  const jobId = item.jobId;
 
   if (!jobId) {
-    console.error('[ORG-CB] No jobId in callback payload, cannot proceed.');
+    console.error(
+      '❌ [ORG-CB] Missing jobId in organic callback payload:',
+      JSON.stringify(body)
+    );
     return;
   }
 
-  // List of columns we expect from n8n / your organic process
-  const rankCols = [];
-  for (let i = 1; i <= 10; i++) {
-    rankCols.push(`rank${i}Name`);
-    rankCols.push(`rank${i}Url`);
+  const job = await loadJob(jobId);
+  if (!job) {
+    console.warn(
+      `⚠️ [ORG-CB] No job found for jobId=${jobId}, marking segment failed.`
+    );
+    await markSegmentStatus(jobId, '7_organicSearch_Status', 'failed');
+    await recomputeMainStatus(jobId);
+    return;
   }
 
-  // Build params and update SET clause
-  const params = { jobId };
-  const setClauses = [];
-
-  let hasNull = false;
-
-  for (const col of rankCols) {
-    const val = item[col] ?? null;
-    params[col] = val;
-    setClauses.push(`${col} = @${col}`);
-    if (val === null || val === undefined || val === '') {
-      hasNull = true;
-    }
-  }
-
-  // Decide status in 7_organicSearch_Jobs table:
-  // - If any null/empty → failed
-  // - Else → completed
-  const newStatus = hasNull ? 'failed' : 'completed';
-  params.status = newStatus;
+  const { businessName, createdAt } = job;
+  const createdAtTs = createdAt?.value || createdAt || null;
 
   console.log(
-    `ℹ️ [ORG-CB] Upserting organic results for job ${jobId} into ${ORG_TABLE}, status=${newStatus}`
+    `▶️ [ORG-CB] Processing organic callback for job ${jobId} (location=${job.location}, services=${job.services})`
   );
 
-  const updateSql = `
-    UPDATE \`${ORG_TABLE}\`
-    SET
-      ${setClauses.join(', ')},
-      status = @status
-    WHERE jobId = @jobId
-  `;
+  // Build MERGE for all rank fields coming back from n8n
+  const params = {
+    jobId,
+    businessName: businessName || null,
+    date: createdAtTs,
+    rank1Name: item.rank1Name || null,
+    rank1Url: item.rank1Url || null,
+    rank2Name: item.rank2Name || null,
+    rank2Url: item.rank2Url || null,
+    rank3Name: item.rank3Name || null,
+    rank3Url: item.rank3Url || null,
+    rank4Name: item.rank4Name || null,
+    rank4Url: item.rank4Url || null,
+    rank5Name: item.rank5Name || null,
+    rank5Url: item.rank5Url || null,
+    rank6Name: item.rank6Name || null,
+    rank6Url: item.rank6Url || null,
+    rank7Name: item.rank7Name || null,
+    rank7Url: item.rank7Url || null,
+    rank8Name: item.rank8Name || null,
+    rank8Url: item.rank8Url || null,
+    rank9Name: item.rank9Name || null,
+    rank9Url: item.rank9Url || null,
+    rank10Name: item.rank10Name || null,
+    rank10Url: item.rank10Url || null,
+  };
 
   try {
-    const [result] = await bigquery.query({
-      query: updateSql,
+    await bigquery.query({
+      query: `
+        MERGE \`${ORG_TABLE}\` T
+        USING (
+          SELECT
+            @jobId AS jobId,
+            @businessName AS businessName,
+            @date AS date,
+            @rank1Name AS rank1Name,
+            @rank1Url AS rank1Url,
+            @rank2Name AS rank2Name,
+            @rank2Url AS rank2Url,
+            @rank3Name AS rank3Name,
+            @rank3Url AS rank3Url,
+            @rank4Name AS rank4Name,
+            @rank4Url AS rank4Url,
+            @rank5Name AS rank5Name,
+            @rank5Url AS rank5Url,
+            @rank6Name AS rank6Name,
+            @rank6Url AS rank6Url,
+            @rank7Name AS rank7Name,
+            @rank7Url AS rank7Url,
+            @rank8Name AS rank8Name,
+            @rank8Url AS rank8Url,
+            @rank9Name AS rank9Name,
+            @rank9Url AS rank9Url,
+            @rank10Name AS rank10Name,
+            @rank10Url AS rank10Url,
+            'completed' AS status
+        ) S
+        ON T.jobId = S.jobId
+        WHEN NOT MATCHED THEN
+          INSERT (
+            jobId,
+            businessName,
+            date,
+            rank1Name,
+            rank1Url,
+            rank2Name,
+            rank2Url,
+            rank3Name,
+            rank3Url,
+            rank4Name,
+            rank4Url,
+            rank5Name,
+            rank5Url,
+            rank6Name,
+            rank6Url,
+            rank7Name,
+            rank7Url,
+            rank8Name,
+            rank8Url,
+            rank9Name,
+            rank9Url,
+            rank10Name,
+            rank10Url,
+            status
+          )
+          VALUES (
+            S.jobId,
+            S.businessName,
+            S.date,
+            S.rank1Name,
+            S.rank1Url,
+            S.rank2Name,
+            S.rank2Url,
+            S.rank3Name,
+            S.rank3Url,
+            S.rank4Name,
+            S.rank4Url,
+            S.rank5Name,
+            S.rank5Url,
+            S.rank6Name,
+            S.rank6Url,
+            S.rank7Name,
+            S.rank7Url,
+            S.rank8Name,
+            S.rank8Url,
+            S.rank9Name,
+            S.rank9Url,
+            S.rank10Name,
+            S.rank10Url,
+            S.status
+          )
+        WHEN MATCHED THEN
+          UPDATE SET
+            businessName = S.businessName,
+            date = S.date,
+            rank1Name = S.rank1Name,
+            rank1Url = S.rank1Url,
+            rank2Name = S.rank2Name,
+            rank2Url = S.rank2Url,
+            rank3Name = S.rank3Name,
+            rank3Url = S.rank3Url,
+            rank4Name = S.rank4Name,
+            rank4Url = S.rank4Url,
+            rank5Name = S.rank5Name,
+            rank5Url = S.rank5Url,
+            rank6Name = S.rank6Name,
+            rank6Url = S.rank6Url,
+            rank7Name = S.rank7Name,
+            rank7Url = S.rank7Url,
+            rank8Name = S.rank8Name,
+            rank8Url = S.rank8Url,
+            rank9Name = S.rank9Name,
+            rank9Url = S.rank9Url,
+            rank10Name = S.rank10Name,
+            rank10Url = S.rank10Url,
+            status = S.status
+      `,
       params,
+      types: {
+        jobId: 'STRING',
+        businessName: 'STRING',
+        date: 'TIMESTAMP',
+        rank1Name: 'STRING',
+        rank1Url: 'STRING',
+        rank2Name: 'STRING',
+        rank2Url: 'STRING',
+        rank3Name: 'STRING',
+        rank3Url: 'STRING',
+        rank4Name: 'STRING',
+        rank4Url: 'STRING',
+        rank5Name: 'STRING',
+        rank5Url: 'STRING',
+        rank6Name: 'STRING',
+        rank6Url: 'STRING',
+        rank7Name: 'STRING',
+        rank7Url: 'STRING',
+        rank8Name: 'STRING',
+        rank8Url: 'STRING',
+        rank9Name: 'STRING',
+        rank9Url: 'STRING',
+        rank10Name: 'STRING',
+        rank10Url: 'STRING',
+      },
     });
+
     console.log(
-      `✅ [ORG-CB] Organic results update completed for job ${jobId}.`,
-      result ? '' : ''
+      `✅ [ORG-CB] MERGE completed for job ${jobId} into ${ORG_TABLE}`
     );
+
+    // If we want, we could re-check for nulls here and set status=failed, but
+    // BigQuery MERGE succeeded and we set status='completed' above.
+    await markSegmentStatus(jobId, '7_organicSearch_Status', 'completed');
+    await recomputeMainStatus(jobId);
   } catch (err) {
     console.error(
-      `❌ [ORG-CB] MERGE/UPDATE FAILED for job ${jobId}:`,
-      err
+      `❌ [ORG-CB] MERGE FAILED for job ${jobId}:`,
+      err.message || err
     );
-    // Mark segment failed on error
+    // mark failed so main status can move on
     await markSegmentStatus(jobId, '7_organicSearch_Status', 'failed');
-    return;
+    await recomputeMainStatus(jobId);
   }
-
-  // Now set segment status on main jobs table
-  await markSegmentStatus(jobId, '7_organicSearch_Status', newStatus);
-  console.log(
-    `✅ [ORG-CB] Segment 7_organicSearch_Status set to '${newStatus}' for job ${jobId} (and main status recomputed).`
-  );
 }
 
 module.exports = {
